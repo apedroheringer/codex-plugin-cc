@@ -6,6 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { withLock } from "./locking.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -111,6 +112,16 @@ async function isBrokerEndpointReady(endpoint) {
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
+  const stateDir = resolveStateDir(cwd);
+  fs.mkdirSync(stateDir, { recursive: true });
+  // Serialize the check-then-create sequence per workspace so two concurrent
+  // callers cannot both miss the existing broker and spawn a duplicate.
+  return withLock(path.join(stateDir, ".broker.lock"), () => ensureBrokerSessionLocked(cwd, options), {
+    timeoutMs: options.lockTimeoutMs ?? 10000
+  });
+}
+
+async function ensureBrokerSessionLocked(cwd, options = {}) {
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;

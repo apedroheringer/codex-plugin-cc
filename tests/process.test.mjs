@@ -1,7 +1,24 @@
+import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { runCommand, runCommandChecked, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+
+const SELF_TERMINATING_SCRIPT = "process.kill(process.pid, 'SIGTERM'); setInterval(() => {}, 1000);";
+
+test("runCommand reports a signal-terminated process as a failure", { skip: process.platform === "win32" }, () => {
+  const result = runCommand(process.execPath, ["-e", SELF_TERMINATING_SCRIPT]);
+
+  assert.equal(result.signal, "SIGTERM");
+  assert.notEqual(result.status, 0);
+});
+
+test("runCommandChecked throws when the process dies from a signal", { skip: process.platform === "win32" }, () => {
+  assert.throws(
+    () => runCommandChecked(process.execPath, ["-e", SELF_TERMINATING_SCRIPT]),
+    /signal=SIGTERM/
+  );
+});
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;

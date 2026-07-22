@@ -2233,6 +2233,16 @@ test("status reports shared session runtime when a lazy broker is active", () =>
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Session runtime: shared session/);
+
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      cwd: repo
+    })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
 test("setup and status honor --cwd when reading shared session runtime", () => {

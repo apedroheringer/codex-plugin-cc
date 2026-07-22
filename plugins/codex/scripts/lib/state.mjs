@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { withLockSync } from "./locking.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -89,9 +90,29 @@ function removeFileIfExists(filePath) {
   }
 }
 
-export function saveState(cwd, state) {
+function resolveStateLockDir(cwd) {
+  return path.join(resolveStateDir(cwd), ".state.lock");
+}
+
+function writeStateFileAtomic(stateFile, nextState) {
+  const tmpFile = `${stateFile}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    const fd = fs.openSync(tmpFile, "w");
+    try {
+      fs.writeFileSync(fd, `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmpFile, stateFile);
+  } catch (error) {
+    removeFileIfExists(tmpFile);
+    throw error;
+  }
+}
+
+function saveStateLocked(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
-  ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
   const nextState = {
     version: STATE_VERSION,
@@ -111,14 +132,22 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeStateFileAtomic(resolveStateFile(cwd), nextState);
   return nextState;
 }
 
+export function saveState(cwd, state) {
+  ensureStateDir(cwd);
+  return withLockSync(resolveStateLockDir(cwd), () => saveStateLocked(cwd, state));
+}
+
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  ensureStateDir(cwd);
+  return withLockSync(resolveStateLockDir(cwd), () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveStateLocked(cwd, state);
+  });
 }
 
 export function generateJobId(prefix = "job") {

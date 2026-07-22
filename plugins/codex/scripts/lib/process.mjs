@@ -16,7 +16,9 @@ export function runCommand(command, args = [], options = {}) {
   return {
     command,
     args,
-    status: result.status ?? 0,
+    // A null status with a signal means the process was killed; never report
+    // signal-terminated commands as exit 0.
+    status: result.status ?? (result.signal != null ? 1 : 0),
     signal: result.signal ?? null,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",

@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { withLock } from "./locking.mjs";
 import {
+  isProcessRunning,
   isProcessTreeRunning,
   processHasLaunchToken,
   terminateProcessTree,
@@ -255,7 +256,10 @@ function canDiscardUnownedSession(session, pid) {
  * timeout, which is what a live-but-hung broker produces — resolves true so that
  * callers stay conservative and never unlink a socket that someone else owns.
  */
-function endpointAcceptsConnection(endpoint, timeoutMs = 250) {
+function endpointAcceptsConnection(endpoint, timeoutMs) {
+  // socket.setTimeout(0) disables the timer outright, which would leave this
+  // promise pending forever on a connection that never settles.
+  const deadlineMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 250;
   return new Promise((resolve) => {
     let socket;
     try {
@@ -273,7 +277,7 @@ function endpointAcceptsConnection(endpoint, timeoutMs = 250) {
       socket.destroy();
       resolve(value);
     };
-    socket.setTimeout(timeoutMs, () => finish(true));
+    socket.setTimeout(deadlineMs, () => finish(true));
     socket.on("connect", () => finish(true));
     socket.on("error", (error) => {
       const code = error?.code;
@@ -283,15 +287,52 @@ function endpointAcceptsConnection(endpoint, timeoutMs = 250) {
 }
 
 /**
+ * True when the endpoint path lives inside the session directory this plugin
+ * created. Those directories come from mkdtemp with mode 0700, so a path under
+ * one is ours by construction — an unrelated process cannot have placed its
+ * socket there. Reclaiming is confined to that subtree so a persisted endpoint
+ * pointing anywhere else is never unlinked.
+ */
+function endpointIsInsideSessionDir(session) {
+  if (!session.sessionDir || !session.endpoint) {
+    return false;
+  }
+  try {
+    const target = parseBrokerEndpoint(session.endpoint);
+    if (target.kind !== "unix") {
+      return false;
+    }
+    const sessionDir = path.resolve(session.sessionDir);
+    const relative = path.relative(sessionDir, path.resolve(target.path));
+    return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * A stale socket left behind by an owned broker that died before acknowledging
  * shutdown. Ownership cannot be proven by RPC in that case — the process that
- * would answer is gone — so possession is established from two independent
- * signals instead: the recorded PID is no longer running AND the endpoint
- * refuses connections. Either one alone is ambiguous (PIDs get reused; a hung
- * broker also fails to answer), so both are required before unlinking.
+ * would answer is gone — so possession is established from independent signals
+ * instead, all of which must hold:
+ *
+ *   1. the socket sits inside the 0700 session directory we created;
+ *   2. neither the recorded PID nor its process group is still running;
+ *   3. connecting to the endpoint is refused.
+ *
+ * No single one is sufficient. A hung broker also fails to answer, PID numbers
+ * get reused, and a refused connect only proves nothing is listening *right
+ * now* — a process that has bound but not yet listened also refuses. Requiring
+ * all three keeps the blast radius inside our own temp directory.
  */
 async function canReclaimStaleEndpoint(session, pid, options = {}) {
-  if (isValidPid(pid) && isProcessTreeRunning(pid, options)) {
+  if (!endpointIsInsideSessionDir(session)) {
+    return false;
+  }
+  // isProcessTreeRunning() checks the process *group* on Linux, so a reused PID
+  // in another group reads as dead. Pair it with the plain PID check before
+  // treating the owner as gone.
+  if (isValidPid(pid) && (isProcessTreeRunning(pid, options) || isProcessRunning(pid, options))) {
     return false;
   }
   return !(await endpointAcceptsConnection(session.endpoint, options.reclaimProbeTimeoutMs));

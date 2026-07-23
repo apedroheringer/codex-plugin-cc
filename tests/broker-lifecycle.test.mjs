@@ -308,3 +308,78 @@ test("shutdown still refuses to unlink an endpoint someone is listening on", { s
   assert.equal(fs.existsSync(socketPath), true);
   assert.deepEqual(loadBrokerSession(workspace), session);
 });
+
+test("a refused endpoint alone does not justify reclaiming while the owner lives", { skip: process.platform === "win32" }, async (t) => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-live-owner-");
+  const socketPath = path.join(sessionDir, "broker.sock");
+
+  // Live owner, refused endpoint: the socket file exists but nothing listens on
+  // it, which on its own looks exactly like the stale case. The recorded PID is
+  // still running, so the shutdown must not unlink anything.
+  const holder = await spawnSocketHolder(socketPath);
+  t.after(() => {
+    holder.kill("SIGKILL");
+  });
+  fs.unlinkSync(socketPath);
+  fs.writeFileSync(socketPath, "");
+
+  const session = {
+    endpoint: `unix:${socketPath}`,
+    pid: holder.pid,
+    pidFile: null,
+    logFile: null,
+    sessionDir,
+    instanceToken: "live-owner-token"
+  };
+  saveBrokerSession(workspace, session);
+
+  await assert.rejects(
+    shutdownBrokerSession(workspace, {
+      session,
+      timeoutMs: 40,
+      killProcess: () => {}
+    }),
+    /ownership could not be verified|did not exit/i
+  );
+
+  assert.equal(fs.existsSync(socketPath), true);
+  assert.deepEqual(loadBrokerSession(workspace), session);
+});
+
+test("an endpoint outside the plugin session directory is never reclaimed", { skip: process.platform === "win32" }, async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-outside-");
+  const elsewhere = makeTempDir("not-a-session-dir-");
+  const socketPath = path.join(elsewhere, "broker.sock");
+
+  const holder = await spawnSocketHolder(socketPath);
+  const deadPid = holder.pid;
+  holder.kill("SIGKILL");
+  await new Promise((resolve) => holder.once("exit", resolve));
+  assert.equal(fs.existsSync(socketPath), true);
+
+  // Everything else looks reclaimable — dead PID, refused connect — but the
+  // endpoint does not live under the session directory we created.
+  const session = {
+    endpoint: `unix:${socketPath}`,
+    pid: deadPid,
+    pidFile: null,
+    logFile: null,
+    sessionDir,
+    instanceToken: "outside-token"
+  };
+  saveBrokerSession(workspace, session);
+
+  await assert.rejects(
+    shutdownBrokerSession(workspace, {
+      session,
+      timeoutMs: 40,
+      killProcess: terminateProcessTree
+    }),
+    /ownership could not be verified/i
+  );
+
+  assert.equal(fs.existsSync(socketPath), true, "foreign socket must survive");
+  fs.unlinkSync(socketPath);
+});

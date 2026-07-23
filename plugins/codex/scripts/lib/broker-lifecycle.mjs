@@ -247,10 +247,60 @@ function canDiscardUnownedSession(session, pid) {
   return processExited && !endpointArtifactExists(session.endpoint);
 }
 
+/**
+ * Resolves false only when nothing can possibly be listening on the endpoint.
+ *
+ * A refused connection (or a socket path that is already gone) is the one signal
+ * that positively rules out a live listener. Every other outcome — including a
+ * timeout, which is what a live-but-hung broker produces — resolves true so that
+ * callers stay conservative and never unlink a socket that someone else owns.
+ */
+function endpointAcceptsConnection(endpoint, timeoutMs = 250) {
+  return new Promise((resolve) => {
+    let socket;
+    try {
+      socket = connectToEndpoint(endpoint);
+    } catch {
+      resolve(true);
+      return;
+    }
+    let settled = false;
+    const finish = (value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(value);
+    };
+    socket.setTimeout(timeoutMs, () => finish(true));
+    socket.on("connect", () => finish(true));
+    socket.on("error", (error) => {
+      const code = error?.code;
+      finish(!(code === "ECONNREFUSED" || code === "ENOENT"));
+    });
+  });
+}
+
+/**
+ * A stale socket left behind by an owned broker that died before acknowledging
+ * shutdown. Ownership cannot be proven by RPC in that case — the process that
+ * would answer is gone — so possession is established from two independent
+ * signals instead: the recorded PID is no longer running AND the endpoint
+ * refuses connections. Either one alone is ambiguous (PIDs get reused; a hung
+ * broker also fails to answer), so both are required before unlinking.
+ */
+async function canReclaimStaleEndpoint(session, pid, options = {}) {
+  if (isValidPid(pid) && isProcessTreeRunning(pid, options)) {
+    return false;
+  }
+  return !(await endpointAcceptsConnection(session.endpoint, options.reclaimProbeTimeoutMs));
+}
+
 export async function shutdownBrokerSession(cwd, options = {}) {
   const session = options.session ?? loadBrokerSession(cwd);
   if (!session) {
-    return { found: false, exited: true, forced: false };
+    return { found: false, exited: true, forced: false, reclaimedStaleEndpoint: false };
   }
 
   const pid = resolveBrokerPid(session);
@@ -263,7 +313,7 @@ export async function shutdownBrokerSession(cwd, options = {}) {
         sessionDir: session.sessionDir ?? null
       });
       clearBrokerSession(cwd);
-      return { found: true, exited: true, forced: false };
+      return { found: true, exited: true, forced: false, reclaimedStaleEndpoint: false };
     }
     throw new Error("Codex app-server broker ownership could not be verified; persisted state was preserved.");
   }
@@ -362,19 +412,29 @@ export async function shutdownBrokerSession(cwd, options = {}) {
   if (!exited) {
     throw new Error(`Codex app-server broker ${verifiedPid ?? session.endpoint ?? "unknown"} did not exit.`);
   }
+  // A broker that is killed after binding its socket can never send a shutdown
+  // ack, so ownershipVerified stays false while the socket file survives. Left
+  // fatal, that single stale socket wedges every later command in the workspace,
+  // because ensureBrokerSession() shuts the old session down before starting a
+  // replacement. Reclaim it when it is provably dead instead of throwing.
+  let reclaimedStaleEndpoint = false;
   if (!ownershipVerified && endpointArtifactExists(session.endpoint)) {
-    throw new Error("Codex app-server broker endpoint ownership could not be verified; persisted state was preserved.");
+    reclaimedStaleEndpoint = await canReclaimStaleEndpoint(session, pid, options);
+    if (!reclaimedStaleEndpoint) {
+      throw new Error("Codex app-server broker endpoint ownership could not be verified; persisted state was preserved.");
+    }
   }
 
+  const endpointIsOurs = ownershipVerified || reclaimedStaleEndpoint;
   teardownBrokerSession({
-    endpoint: ownershipVerified ? session.endpoint ?? null : null,
+    endpoint: endpointIsOurs ? session.endpoint ?? null : null,
     pidFile: session.pidFile ?? null,
     logFile: session.logFile ?? null,
     sessionDir: session.sessionDir ?? null,
-    ownershipVerified
+    ownershipVerified: endpointIsOurs
   });
   clearBrokerSession(cwd);
-  return { found: true, exited: true, forced };
+  return { found: true, exited: true, forced, reclaimedStaleEndpoint };
 }
 
 async function isBrokerEndpointReady(endpoint) {

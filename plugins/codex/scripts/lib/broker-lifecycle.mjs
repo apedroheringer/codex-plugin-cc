@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -5,16 +6,40 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { withLock } from "./locking.mjs";
+import {
+  isProcessTreeRunning,
+  processHasLaunchToken,
+  terminateProcessTree,
+  waitForProcessExit
+} from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
+const PRIVATE_DIR_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
+
+function setMode(filePath, mode) {
+  try {
+    fs.chmodSync(filePath, mode);
+  } catch {
+    // Windows and restrictive filesystems may not implement POSIX modes.
+  }
+}
+
+function ensurePrivateDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR_MODE });
+  setMode(dir, PRIVATE_DIR_MODE);
+}
 
 export function createBrokerSessionDir(prefix = "cxc-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  setMode(sessionDir, PRIVATE_DIR_MODE);
+  return sessionDir;
 }
 
 function connectToEndpoint(endpoint) {
@@ -23,15 +48,22 @@ function connectToEndpoint(endpoint) {
 }
 
 export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
     const ready = await new Promise((resolve) => {
       const socket = connectToEndpoint(endpoint);
-      socket.on("connect", () => {
-        socket.end();
-        resolve(true);
-      });
-      socket.on("error", () => resolve(false));
+      let settled = false;
+      const finish = (value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        socket.destroy();
+        resolve(value);
+      };
+      socket.setTimeout(Math.max(1, Math.min(150, deadline - Date.now())), () => finish(false));
+      socket.on("connect", () => finish(true));
+      socket.on("error", () => finish(false));
     });
     if (ready) {
       return true;
@@ -41,33 +73,90 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   return false;
 }
 
-export async function sendBrokerShutdown(endpoint) {
-  await new Promise((resolve) => {
+export async function sendBrokerShutdown(endpoint, options = {}) {
+  return await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
+    let settled = false;
+    let buffer = "";
+    const finish = (result = null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(result);
+    };
     socket.setEncoding("utf8");
+    socket.setTimeout(options.timeoutMs ?? 2000, () => finish(null));
     socket.on("connect", () => {
-      socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
+      socket.write(
+        `${JSON.stringify({
+          id: 1,
+          method: "broker/shutdown",
+          params: { instanceToken: options.instanceToken ?? null }
+        })}\n`
+      );
     });
-    socket.on("data", () => {
-      socket.end();
-      resolve();
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex === -1) {
+        return;
+      }
+      try {
+        const response = JSON.parse(buffer.slice(0, newlineIndex));
+        finish({ result: response?.result ?? null, error: response?.error ?? null });
+      } catch {
+        finish(null);
+      }
     });
-    socket.on("error", resolve);
-    socket.on("close", resolve);
+    socket.on("error", () => finish(null));
+    socket.on("close", () => finish(null));
   });
 }
 
-export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
-  const logFd = fs.openSync(logFile, "a");
-  const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
-    cwd,
-    env,
-    detached: true,
-    stdio: ["ignore", logFd, logFd]
-  });
-  child.unref();
-  fs.closeSync(logFd);
-  return child;
+function isValidPid(pid) {
+  return Number.isSafeInteger(pid) && pid > 0;
+}
+
+export function spawnBrokerProcess({
+  scriptPath,
+  cwd,
+  endpoint,
+  pidFile,
+  logFile,
+  instanceToken,
+  env = process.env
+}) {
+  const logFd = fs.openSync(logFile, "a", PRIVATE_FILE_MODE);
+  try {
+    setMode(logFile, PRIVATE_FILE_MODE);
+    const child = spawn(
+      process.execPath,
+      [
+        scriptPath,
+        "serve",
+        "--endpoint",
+        endpoint,
+        "--cwd",
+        cwd,
+        "--pid-file",
+        pidFile,
+        "--instance-token",
+        instanceToken
+      ],
+      {
+        cwd,
+        env,
+        detached: true,
+        stdio: ["ignore", logFd, logFd]
+      }
+    );
+    child.unref();
+    return child;
+  } finally {
+    fs.closeSync(logFd);
+  }
 }
 
 function resolveBrokerStateFile(cwd) {
@@ -89,15 +178,203 @@ export function loadBrokerSession(cwd) {
 
 export function saveBrokerSession(cwd, session) {
   const stateDir = resolveStateDir(cwd);
-  fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  ensurePrivateDir(stateDir);
+  const stateFile = resolveBrokerStateFile(cwd);
+  const tmpFile = `${stateFile}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    const fd = fs.openSync(tmpFile, "wx", PRIVATE_FILE_MODE);
+    try {
+      setMode(tmpFile, PRIVATE_FILE_MODE);
+      fs.writeFileSync(fd, `${JSON.stringify(session, null, 2)}\n`, "utf8");
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmpFile, stateFile);
+    setMode(stateFile, PRIVATE_FILE_MODE);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {
+      // Temp file may not have been created or may already be gone.
+    }
+    throw error;
+  }
 }
 
 export function clearBrokerSession(cwd) {
   const stateFile = resolveBrokerStateFile(cwd);
-  if (fs.existsSync(stateFile)) {
+  try {
     fs.unlinkSync(stateFile);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
   }
+}
+
+function resolveBrokerPid(session) {
+  const statePid = isValidPid(session.pid) ? session.pid : null;
+  let filePid = null;
+  if (session.pidFile && fs.existsSync(session.pidFile)) {
+    const rawPid = fs.readFileSync(session.pidFile, "utf8").trim();
+    if (/^\d+$/.test(rawPid)) {
+      const parsedPid = Number(rawPid);
+      filePid = isValidPid(parsedPid) ? parsedPid : null;
+    }
+  }
+  if (statePid && filePid && statePid !== filePid) {
+    throw new Error(`Codex app-server broker PID mismatch (${statePid} != ${filePid}).`);
+  }
+  return statePid ?? filePid;
+}
+
+function endpointArtifactExists(endpoint) {
+  if (!endpoint) {
+    return false;
+  }
+  try {
+    const target = parseBrokerEndpoint(endpoint);
+    // Named pipes have no filesystem artifact for teardown to unlink.
+    return target.kind === "unix" && fs.existsSync(target.path);
+  } catch {
+    return true;
+  }
+}
+
+function canDiscardUnownedSession(session, pid) {
+  const processExited = !isValidPid(pid) || !isProcessTreeRunning(pid);
+  return processExited && !endpointArtifactExists(session.endpoint);
+}
+
+export async function shutdownBrokerSession(cwd, options = {}) {
+  const session = options.session ?? loadBrokerSession(cwd);
+  if (!session) {
+    return { found: false, exited: true, forced: false };
+  }
+
+  const pid = resolveBrokerPid(session);
+  if (session.endpoint && !session.instanceToken) {
+    if (canDiscardUnownedSession(session, pid)) {
+      teardownBrokerSession({
+        endpoint: null,
+        pidFile: session.pidFile ?? null,
+        logFile: session.logFile ?? null,
+        sessionDir: session.sessionDir ?? null
+      });
+      clearBrokerSession(cwd);
+      return { found: true, exited: true, forced: false };
+    }
+    throw new Error("Codex app-server broker ownership could not be verified; persisted state was preserved.");
+  }
+
+  let shutdownResponse = null;
+  if (session.endpoint) {
+    shutdownResponse = await sendBrokerShutdown(session.endpoint, {
+      timeoutMs: options.timeoutMs,
+      instanceToken: session.instanceToken
+    });
+  }
+  if (shutdownResponse?.error) {
+    throw new Error(
+      `Codex app-server broker rejected shutdown identity; persisted state was preserved: ${
+        shutdownResponse.error.message ?? "unknown error"
+      }`
+    );
+  }
+
+  const shutdownAck = shutdownResponse?.result ?? null;
+  const acknowledgedPid = isValidPid(shutdownAck?.pid) ? shutdownAck.pid : null;
+  const ownershipVerified =
+    Boolean(session.instanceToken) &&
+    shutdownAck?.instanceToken === session.instanceToken &&
+    acknowledgedPid !== null &&
+    (pid === null || pid === acknowledgedPid);
+  if (shutdownAck && !ownershipVerified) {
+    throw new Error("Codex app-server broker shutdown identity did not match persisted state.");
+  }
+
+  let verifiedPid = ownershipVerified ? acknowledgedPid : null;
+  let exited = isValidPid(pid)
+    ? await waitForProcessExit(pid, {
+        timeoutMs: 0,
+        intervalMs: options.intervalMs,
+        killImpl: options.killImpl,
+        platform: options.platform
+      })
+    : false;
+
+  if (!shutdownAck && isValidPid(pid) && !exited) {
+    const ownsPersistedProcess = options.verifyProcess
+      ? options.verifyProcess(pid, session.instanceToken)
+      : processHasLaunchToken(pid, session.instanceToken, {
+          marker: "--instance-token",
+          platform: options.platform,
+          timeoutMs: options.timeoutMs,
+          runCommandImpl: options.runCommandImpl
+        });
+    if (!ownsPersistedProcess) {
+      if (isProcessTreeRunning(pid, options)) {
+        throw new Error("Codex app-server broker ownership could not be verified; persisted state was preserved.");
+      }
+      exited = true;
+    } else {
+      verifiedPid = pid;
+    }
+  }
+
+  if (!shutdownAck && session.instanceToken && !isValidPid(pid)) {
+    throw new Error("Codex app-server broker PID is unavailable; persisted ownership state was preserved.");
+  }
+
+  if (!exited && isValidPid(verifiedPid)) {
+    exited = await waitForProcessExit(verifiedPid, {
+      timeoutMs: options.timeoutMs,
+      intervalMs: options.intervalMs,
+      killImpl: options.killImpl,
+      platform: options.platform
+    });
+  }
+
+  let forced = false;
+  if (!exited && isValidPid(verifiedPid) && options.killProcess) {
+    const stillOwnsProcess = options.verifyProcess
+      ? options.verifyProcess(verifiedPid, session.instanceToken)
+      : processHasLaunchToken(verifiedPid, session.instanceToken, {
+          marker: "--instance-token",
+          platform: options.platform,
+          timeoutMs: options.timeoutMs,
+          runCommandImpl: options.runCommandImpl
+        });
+    if (!stillOwnsProcess) {
+      throw new Error("Codex app-server broker process ownership changed before forced shutdown.");
+    }
+    options.killProcess(verifiedPid);
+    forced = true;
+    exited = await waitForProcessExit(verifiedPid, {
+      timeoutMs: options.timeoutMs,
+      intervalMs: options.intervalMs,
+      killImpl: options.killImpl,
+      platform: options.platform
+    });
+  }
+
+  if (!exited) {
+    throw new Error(`Codex app-server broker ${verifiedPid ?? session.endpoint ?? "unknown"} did not exit.`);
+  }
+  if (!ownershipVerified && endpointArtifactExists(session.endpoint)) {
+    throw new Error("Codex app-server broker endpoint ownership could not be verified; persisted state was preserved.");
+  }
+
+  teardownBrokerSession({
+    endpoint: ownershipVerified ? session.endpoint ?? null : null,
+    pidFile: session.pidFile ?? null,
+    logFile: session.logFile ?? null,
+    sessionDir: session.sessionDir ?? null,
+    ownershipVerified
+  });
+  clearBrokerSession(cwd);
+  return { found: true, exited: true, forced };
 }
 
 async function isBrokerEndpointReady(endpoint) {
@@ -113,12 +390,12 @@ async function isBrokerEndpointReady(endpoint) {
 
 export async function ensureBrokerSession(cwd, options = {}) {
   const stateDir = resolveStateDir(cwd);
-  fs.mkdirSync(stateDir, { recursive: true });
-  // Serialize the check-then-create sequence per workspace so two concurrent
-  // callers cannot both miss the existing broker and spawn a duplicate.
-  return withLock(path.join(stateDir, ".broker.lock"), () => ensureBrokerSessionLocked(cwd, options), {
-    timeoutMs: options.lockTimeoutMs ?? 10000
-  });
+  ensurePrivateDir(stateDir);
+  return withLock(
+    path.join(stateDir, ".broker.lock"),
+    () => ensureBrokerSessionLocked(cwd, options),
+    { timeoutMs: options.lockTimeoutMs ?? 10000 }
+  );
 }
 
 async function ensureBrokerSessionLocked(cwd, options = {}) {
@@ -128,15 +405,16 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
   }
 
   if (existing) {
-    teardownBrokerSession({
-      endpoint: existing.endpoint ?? null,
-      pidFile: existing.pidFile ?? null,
-      logFile: existing.logFile ?? null,
-      sessionDir: existing.sessionDir ?? null,
-      pid: existing.pid ?? null,
-      killProcess: options.killProcess ?? null
+    await shutdownBrokerSession(cwd, {
+      session: existing,
+      killProcess: options.killProcess ?? terminateProcessTree,
+      verifyProcess: options.verifyProcess,
+      runCommandImpl: options.runCommandImpl,
+      killImpl: options.killImpl,
+      platform: options.platform,
+      timeoutMs: options.timeoutMs,
+      intervalMs: options.intervalMs
     });
-    clearBrokerSession(cwd);
   }
 
   const sessionDir = createBrokerSessionDir();
@@ -145,8 +423,8 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
   const pidFile = path.join(sessionDir, "broker.pid");
   const logFile = path.join(sessionDir, "broker.log");
   const scriptPath =
-    options.scriptPath ??
-    fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
+    options.scriptPath ?? fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
+  const instanceToken = options.instanceToken ?? randomUUID();
 
   const child = spawnBrokerProcess({
     scriptPath,
@@ -154,67 +432,84 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
     endpoint,
     pidFile,
     logFile,
+    instanceToken,
     env: options.env ?? process.env
   });
-
-  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
-  if (!ready) {
-    teardownBrokerSession({
-      endpoint,
-      pidFile,
-      logFile,
-      sessionDir,
-      pid: child.pid ?? null,
-      killProcess: options.killProcess ?? null
-    });
-    return null;
-  }
 
   const session = {
     endpoint,
     pidFile,
     logFile,
     sessionDir,
-    pid: child.pid ?? null
+    pid: child.pid ?? null,
+    instanceToken
   };
   saveBrokerSession(cwd, session);
+
+  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
+  if (!ready) {
+    await shutdownBrokerSession(cwd, {
+      session,
+      killProcess: options.killProcess ?? terminateProcessTree,
+      verifyProcess: options.verifyProcess,
+      runCommandImpl: options.runCommandImpl,
+      killImpl: options.killImpl,
+      platform: options.platform,
+      timeoutMs: options.timeoutMs,
+      intervalMs: options.intervalMs
+    });
+    return null;
+  }
+
   return session;
 }
 
-export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
-  if (Number.isFinite(pid) && killProcess) {
-    try {
-      killProcess(pid);
-    } catch {
-      // Ignore missing or already-exited broker processes.
+export function teardownBrokerSession({
+  endpoint = null,
+  pidFile,
+  logFile,
+  sessionDir = null,
+  ownershipVerified = false
+}) {
+  if (endpoint && !ownershipVerified) {
+    throw new Error("Refusing to remove an unverified broker endpoint.");
+  }
+
+  for (const filePath of [pidFile, logFile]) {
+    if (!filePath) {
+      continue;
     }
-  }
-
-  if (pidFile && fs.existsSync(pidFile)) {
-    fs.unlinkSync(pidFile);
-  }
-
-  if (logFile && fs.existsSync(logFile)) {
-    fs.unlinkSync(logFile);
+    try {
+      fs.unlinkSync(filePath);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
   }
 
   if (endpoint) {
-    try {
-      const target = parseBrokerEndpoint(endpoint);
-      if (target.kind === "unix" && fs.existsSync(target.path)) {
+    const target = parseBrokerEndpoint(endpoint);
+    if (target.kind === "unix") {
+      try {
         fs.unlinkSync(target.path);
+      } catch (error) {
+        if (error?.code !== "ENOENT") {
+          throw error;
+        }
       }
-    } catch {
-      // Ignore malformed or already-removed broker endpoints during teardown.
     }
   }
 
-  const resolvedSessionDir = sessionDir ?? (pidFile ? path.dirname(pidFile) : logFile ? path.dirname(logFile) : null);
-  if (resolvedSessionDir && fs.existsSync(resolvedSessionDir)) {
+  const resolvedSessionDir =
+    sessionDir ?? (pidFile ? path.dirname(pidFile) : logFile ? path.dirname(logFile) : null);
+  if (resolvedSessionDir) {
     try {
       fs.rmdirSync(resolvedSessionDir);
-    } catch {
-      // Ignore non-empty or missing directories.
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTEMPTY") {
+        throw error;
+      }
     }
   }
 }

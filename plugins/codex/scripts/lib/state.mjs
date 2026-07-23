@@ -12,6 +12,8 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const PRIVATE_DIR_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
 
 function nowIso() {
   return new Date().toISOString();
@@ -53,7 +55,16 @@ export function resolveJobsDir(cwd) {
 }
 
 export function ensureStateDir(cwd) {
-  fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
+  const stateDir = resolveStateDir(cwd);
+  const jobsDir = resolveJobsDir(cwd);
+  fs.mkdirSync(jobsDir, { recursive: true, mode: PRIVATE_DIR_MODE });
+  for (const dir of [stateDir, jobsDir]) {
+    try {
+      fs.chmodSync(dir, PRIVATE_DIR_MODE);
+    } catch {
+      // Windows and restrictive filesystems may not implement POSIX modes.
+    }
+  }
 }
 
 export function loadState(cwd) {
@@ -97,14 +108,24 @@ function resolveStateLockDir(cwd) {
 function writeStateFileAtomic(stateFile, nextState) {
   const tmpFile = `${stateFile}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
   try {
-    const fd = fs.openSync(tmpFile, "w");
+    const fd = fs.openSync(tmpFile, "wx", PRIVATE_FILE_MODE);
     try {
+      try {
+        fs.fchmodSync(fd, PRIVATE_FILE_MODE);
+      } catch {
+        // Windows and restrictive filesystems may not implement POSIX modes.
+      }
       fs.writeFileSync(fd, `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
     }
     fs.renameSync(tmpFile, stateFile);
+    try {
+      fs.chmodSync(stateFile, PRIVATE_FILE_MODE);
+    } catch {
+      // Windows and restrictive filesystems may not implement POSIX modes.
+    }
   } catch (error) {
     removeFileIfExists(tmpFile);
     throw error;
@@ -195,7 +216,15 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: PRIVATE_FILE_MODE
+  });
+  try {
+    fs.chmodSync(jobFile, PRIVATE_FILE_MODE);
+  } catch {
+    // Windows and restrictive filesystems may not implement POSIX modes.
+  }
   return jobFile;
 }
 

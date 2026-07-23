@@ -2,7 +2,12 @@ import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { runCommand, runCommandChecked, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import {
+  isProcessRunning,
+  runCommand,
+  runCommandChecked,
+  terminateProcessTree
+} from "../plugins/codex/scripts/lib/process.mjs";
 
 const SELF_TERMINATING_SCRIPT = "process.kill(process.pid, 'SIGTERM'); setInterval(() => {}, 1000);";
 
@@ -10,7 +15,7 @@ test("runCommand reports a signal-terminated process as a failure", { skip: proc
   const result = runCommand(process.execPath, ["-e", SELF_TERMINATING_SCRIPT]);
 
   assert.equal(result.signal, "SIGTERM");
-  assert.notEqual(result.status, 0);
+  assert.equal(result.status, null);
 });
 
 test("runCommandChecked throws when the process dies from a signal", { skip: process.platform === "win32" }, () => {
@@ -18,6 +23,18 @@ test("runCommandChecked throws when the process dies from a signal", { skip: pro
     () => runCommandChecked(process.execPath, ["-e", SELF_TERMINATING_SCRIPT]),
     /signal=SIGTERM/
   );
+});
+
+test("Linux zombie processes are treated as exited even when signal 0 succeeds", () => {
+  const running = isProcessRunning(1234, {
+    platform: "linux",
+    killImpl() {},
+    readProcessStat() {
+      return { state: "Z", startTime: "42" };
+    }
+  });
+
+  assert.equal(running, false);
 });
 
 test("terminateProcessTree uses taskkill on Windows", () => {

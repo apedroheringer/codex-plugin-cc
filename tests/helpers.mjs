@@ -5,7 +5,10 @@ import process from "node:process";
 import { spawnSync } from "node:child_process";
 import { after } from "node:test";
 
-import { loadBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import {
+  loadBrokerSession,
+  shutdownBrokerSession
+} from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 
 const trackedTempDirs = [];
@@ -16,73 +19,32 @@ export function makeTempDir(prefix = "codex-plugin-test-") {
   return dir;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function pidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function readBrokerPid(session) {
-  if (Number.isFinite(session.pid)) {
-    return session.pid;
-  }
-  try {
-    const parsed = Number.parseInt(fs.readFileSync(session.pidFile, "utf8").trim(), 10);
-    return Number.isFinite(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
 // Global teardown: any broker a test started (directly or lazily) and did not
 // tear down is shut down here, so the suite never leaves broker/app-server
 // processes behind — even when a test fails or returns early.
 after(async () => {
-  const leakedPids = [];
-  const leakedSessions = [];
+  const failures = [];
   for (const dir of trackedTempDirs) {
     const session = loadBrokerSession(dir);
-    if (!session) {
+    // A fixture may deliberately persist an arbitrary endpoint. Only sessions
+    // with the per-process secret introduced by ensureBrokerSession are ours.
+    if (!session?.instanceToken) {
       continue;
     }
-    leakedSessions.push(session);
-    if (session.endpoint) {
-      await sendBrokerShutdown(session.endpoint);
-    }
-    const pid = readBrokerPid(session);
-    if (Number.isFinite(pid)) {
-      leakedPids.push(pid);
-    }
-  }
-
-  const deadline = Date.now() + 3000;
-  for (const pid of leakedPids) {
-    while (pidAlive(pid) && Date.now() < deadline) {
-      await sleep(50);
-    }
-    if (pidAlive(pid)) {
-      terminateProcessTree(pid);
-      await sleep(200);
-    }
-    if (pidAlive(pid)) {
-      throw new Error(`Leaked broker process ${pid} survived suite teardown.`);
+    try {
+      await shutdownBrokerSession(dir, {
+        session,
+        killProcess: terminateProcessTree,
+        timeoutMs: 1000,
+        intervalMs: 25
+      });
+    } catch (error) {
+      failures.push(error);
     }
   }
 
-  for (const session of leakedSessions) {
-    teardownBrokerSession({
-      endpoint: session.endpoint ?? null,
-      pidFile: session.pidFile ?? null,
-      logFile: session.logFile ?? null,
-      sessionDir: session.sessionDir ?? null
-    });
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Owned broker teardown did not finish.");
   }
 });
 

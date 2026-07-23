@@ -41,28 +41,39 @@ function writePidFile(pidFile) {
   if (!pidFile) {
     return;
   }
-  fs.mkdirSync(path.dirname(pidFile), { recursive: true });
-  fs.writeFileSync(pidFile, `${process.pid}\n`, "utf8");
+  fs.mkdirSync(path.dirname(pidFile), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(pidFile, `${process.pid}\n`, { encoding: "utf8", mode: 0o600 });
+  try {
+    fs.chmodSync(pidFile, 0o600);
+  } catch {
+    // Windows and restrictive filesystems may not implement POSIX modes.
+  }
 }
 
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
-    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
+    throw new Error(
+      "Usage: node scripts/app-server-broker.mjs serve --endpoint <value> --instance-token <value> [--cwd <path>] [--pid-file <path>]"
+    );
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "endpoint", "instance-token"]
   });
 
   if (!options.endpoint) {
     throw new Error("Missing required --endpoint.");
+  }
+  if (!options["instance-token"]) {
+    throw new Error("Missing required --instance-token.");
   }
 
   const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const instanceToken = String(options["instance-token"]);
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
@@ -158,7 +169,17 @@ async function main() {
         }
 
         if (message.id !== undefined && message.method === "broker/shutdown") {
-          send(socket, { id: message.id, result: {} });
+          if (message.params?.instanceToken !== instanceToken) {
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(-32003, "Broker shutdown identity did not match this instance.")
+            });
+            continue;
+          }
+          send(socket, {
+            id: message.id,
+            result: { pid: process.pid, instanceToken }
+          });
           await shutdown(server);
           process.exit(0);
         }

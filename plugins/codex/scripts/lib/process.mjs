@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import process from "node:process";
 
 export function runCommand(command, args = [], options = {}) {
@@ -8,6 +9,8 @@ export function runCommand(command, args = [], options = {}) {
     encoding: "utf8",
     input: options.input,
     maxBuffer: options.maxBuffer,
+    timeout: options.timeout,
+    killSignal: options.killSignal,
     stdio: options.stdio ?? "pipe",
     shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
     windowsHide: true
@@ -16,9 +19,9 @@ export function runCommand(command, args = [], options = {}) {
   return {
     command,
     args,
-    // A null status with a signal means the process was killed; never report
-    // signal-terminated commands as exit 0.
-    status: result.status ?? (result.signal != null ? 1 : 0),
+    // Preserve Node's spawnSync contract: signal-terminated commands have a
+    // null status and a non-null signal.
+    status: result.status,
     signal: result.signal ?? null,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
@@ -31,7 +34,7 @@ export function runCommandChecked(command, args = [], options = {}) {
   if (result.error) {
     throw result.error;
   }
-  if (result.status !== 0) {
+  if (result.signal != null || result.status !== 0) {
     throw new Error(formatCommandFailure(result));
   }
   return result;
@@ -45,8 +48,11 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
   if (result.error) {
     return { available: false, detail: result.error.message };
   }
-  if (result.status !== 0) {
-    const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`;
+  if (result.signal != null || result.status !== 0) {
+    const detail =
+      result.stderr.trim() ||
+      result.stdout.trim() ||
+      (result.signal != null ? `signal ${result.signal}` : `exit ${result.status}`);
     return { available: false, detail };
   }
   return { available: true, detail: result.stdout.trim() || result.stderr.trim() || "ok" };
@@ -56,8 +62,187 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
+function isValidPid(pid) {
+  return Number.isSafeInteger(pid) && pid > 0;
+}
+
+function readLinuxProcessStat(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd === -1) {
+      return null;
+    }
+    const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
+    return {
+      state: fields[0] ?? null,
+      processGroup: fields[2] ?? null,
+      // /proc/<pid>/stat field 22; fields starts at field 3.
+      startTime: fields[19] ?? null
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function getProcessIdentity(pid, options = {}) {
+  if (!isValidPid(pid)) {
+    return null;
+  }
+  const platform = options.platform ?? process.platform;
+  if (platform !== "linux") {
+    return null;
+  }
+  return readLinuxProcessStat(pid)?.startTime ?? null;
+}
+
+export function isProcessRunning(pid, options = {}) {
+  if (!isValidPid(pid)) {
+    return false;
+  }
+
+  const platform = options.platform ?? process.platform;
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  try {
+    killImpl(pid, 0);
+  } catch (error) {
+    if (error?.code === "EPERM") {
+      return true;
+    }
+    if (error?.code === "ESRCH") {
+      return false;
+    }
+    throw error;
+  }
+
+  if (platform === "linux") {
+    const readProcessStat = options.readProcessStat ?? readLinuxProcessStat;
+    const stat = readProcessStat(pid);
+    if (!stat) {
+      return false;
+    }
+    // Zombies still answer kill(pid, 0), but no longer own a live resource.
+    if (stat.state === "Z" || stat.state === "X") {
+      return false;
+    }
+    if (options.identity != null && stat.startTime !== String(options.identity)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function isLinuxProcessGroupRunning(pid) {
+  let entries;
+  try {
+    entries = fs.readdirSync("/proc", { withFileTypes: true });
+  } catch {
+    return isProcessRunning(pid);
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) {
+      continue;
+    }
+    const stat = readLinuxProcessStat(Number(entry.name));
+    if (
+      stat?.processGroup === String(pid) &&
+      stat.state !== "Z" &&
+      stat.state !== "X"
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function isProcessTreeRunning(pid, options = {}) {
+  if (!isValidPid(pid)) {
+    return false;
+  }
+  const platform = options.platform ?? process.platform;
+  if (platform === "win32") {
+    return isProcessRunning(pid, options);
+  }
+  if (platform === "linux" && !options.killImpl) {
+    return isLinuxProcessGroupRunning(pid);
+  }
+
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  try {
+    killImpl(-pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") {
+      return false;
+    }
+    if (error?.code === "EPERM") {
+      return true;
+    }
+    throw error;
+  }
+}
+
+export async function waitForProcessExit(pid, options = {}) {
+  if (!isValidPid(pid)) {
+    return false;
+  }
+  const timeoutMs = options.timeoutMs ?? 2000;
+  const intervalMs = options.intervalMs ?? 25;
+  const isRunning = options.tree === false ? isProcessRunning : isProcessTreeRunning;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isRunning(pid, options)) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return !isRunning(pid, options);
+}
+
+export function processHasLaunchToken(pid, token, options = {}) {
+  if (!isValidPid(pid) || typeof token !== "string" || token.length < 16) {
+    return false;
+  }
+
+  const marker = options.marker ?? "--worker-token";
+  const platform = options.platform ?? process.platform;
+  if (platform === "linux") {
+    try {
+      const argv = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+      return argv.includes(marker) && argv.includes(token);
+    } catch {
+      return false;
+    }
+  }
+
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  const result =
+    platform === "win32"
+      ? runCommandImpl(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($null -ne $p) { [Console]::Out.Write($p.CommandLine) }`
+          ],
+          { timeout: options.timeoutMs ?? 2000, killSignal: "SIGTERM" }
+        )
+      : runCommandImpl("ps", ["-ww", "-p", String(pid), "-o", "command="], {
+          timeout: options.timeoutMs ?? 2000,
+          killSignal: "SIGTERM"
+        });
+
+  if (result.error || result.signal != null || result.status !== 0) {
+    return false;
+  }
+  const commandLine = String(result.stdout ?? "");
+  return commandLine.includes(marker) && commandLine.includes(token);
+}
+
 export function terminateProcessTree(pid, options = {}) {
-  if (!Number.isFinite(pid)) {
+  if (!isValidPid(pid)) {
     return { attempted: false, delivered: false, method: null };
   }
 

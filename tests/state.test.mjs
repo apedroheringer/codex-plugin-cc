@@ -8,7 +8,17 @@ import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
-import { listJobs, resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  listJobs,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveJobsDir,
+  resolveStateDir,
+  resolveStateFile,
+  saveState,
+  writeJobFile
+} from "../plugins/codex/scripts/lib/state.mjs";
+import { createJobLogFile } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -41,6 +51,23 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
       process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
     }
   }
+});
+
+test("state, job, and log artifacts are private", { skip: process.platform === "win32" }, () => {
+  const workspace = makeTempDir();
+  saveState(workspace, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: []
+  });
+  const jobFile = writeJobFile(workspace, "private-job", { prompt: "sensitive prompt" });
+  const logFile = createJobLogFile(workspace, "private-job", "Private Job");
+
+  assert.equal(fs.statSync(resolveStateDir(workspace)).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(resolveJobsDir(workspace)).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(resolveStateFile(workspace)).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(jobFile).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(logFile).mode & 0o777, 0o600);
 });
 
 test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", () => {

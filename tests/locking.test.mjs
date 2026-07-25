@@ -4,7 +4,6 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   acquireLock,
@@ -40,16 +39,9 @@ test("lock records its owner privately and release removes only that generation"
 
 test("lock immediately reclaims an owner process that exited", async () => {
   const lockDir = path.join(makeTempDir(), "state.lock");
-  const lockingModuleUrl = pathToFileURL(
-    path.join(
-      path.dirname(fileURLToPath(import.meta.url)),
-      "..",
-      "plugins",
-      "codex",
-      "scripts",
-      "lib",
-      "locking.mjs"
-    )
+  const lockingModuleUrl = new URL(
+    "../plugins/codex/scripts/lib/locking.mjs",
+    import.meta.url
   ).href;
 
   await new Promise((resolve, reject) => {

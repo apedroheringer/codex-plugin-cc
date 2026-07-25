@@ -8,6 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { ensurePrivateDir, writePrivateFile } from "./lib/fs.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -41,13 +42,8 @@ function writePidFile(pidFile) {
   if (!pidFile) {
     return;
   }
-  fs.mkdirSync(path.dirname(pidFile), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(pidFile, `${process.pid}\n`, { encoding: "utf8", mode: 0o600 });
-  try {
-    fs.chmodSync(pidFile, 0o600);
-  } catch {
-    // Windows and restrictive filesystems may not implement POSIX modes.
-  }
+  ensurePrivateDir(path.dirname(pidFile));
+  writePrivateFile(pidFile, `${process.pid}\n`);
 }
 
 async function main() {

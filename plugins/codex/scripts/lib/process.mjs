@@ -227,6 +227,31 @@ export async function waitForProcessExit(pid, options = {}) {
   return !isRunning(pid, options);
 }
 
+function readProcessCommandLine(pid, options) {
+  const platform = options.platform ?? process.platform;
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  const result =
+    platform === "win32"
+      ? runCommandImpl(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($null -ne $p) { [Console]::Out.Write($p.CommandLine) }`
+          ],
+          { timeout: options.timeoutMs ?? 2000, killSignal: "SIGTERM" }
+        )
+      : runCommandImpl("ps", ["-ww", "-p", String(pid), "-o", "command="], {
+          timeout: options.timeoutMs ?? 2000,
+          killSignal: "SIGTERM"
+        });
+  if (result.error || result.signal != null || result.status !== 0) {
+    return null;
+  }
+  return String(result.stdout ?? "");
+}
+
 export function processHasLaunchSequence(pid, expectedArgs, options = {}) {
   if (
     !isValidPid(pid) ||
@@ -250,28 +275,10 @@ export function processHasLaunchSequence(pid, expectedArgs, options = {}) {
     );
   }
 
-  const runCommandImpl = options.runCommandImpl ?? runCommand;
-  const result =
-    platform === "win32"
-      ? runCommandImpl(
-          "powershell.exe",
-          [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($null -ne $p) { [Console]::Out.Write($p.CommandLine) }`
-          ],
-          { timeout: options.timeoutMs ?? 2000, killSignal: "SIGTERM" }
-        )
-      : runCommandImpl("ps", ["-ww", "-p", String(pid), "-o", "command="], {
-          timeout: options.timeoutMs ?? 2000,
-          killSignal: "SIGTERM"
-        });
-
-  if (result.error || result.signal != null || result.status !== 0) {
+  const commandLine = readProcessCommandLine(pid, options);
+  if (commandLine == null) {
     return false;
   }
-  const commandLine = String(result.stdout ?? "");
   let cursor = 0;
   for (const expected of expectedArgs) {
     const index = commandLine.indexOf(expected, cursor);
@@ -299,28 +306,10 @@ export function processHasLaunchToken(pid, token, options = {}) {
     }
   }
 
-  const runCommandImpl = options.runCommandImpl ?? runCommand;
-  const result =
-    platform === "win32"
-      ? runCommandImpl(
-          "powershell.exe",
-          [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($null -ne $p) { [Console]::Out.Write($p.CommandLine) }`
-          ],
-          { timeout: options.timeoutMs ?? 2000, killSignal: "SIGTERM" }
-        )
-      : runCommandImpl("ps", ["-ww", "-p", String(pid), "-o", "command="], {
-          timeout: options.timeoutMs ?? 2000,
-          killSignal: "SIGTERM"
-        });
-
-  if (result.error || result.signal != null || result.status !== 0) {
+  const commandLine = readProcessCommandLine(pid, options);
+  if (commandLine == null) {
     return false;
   }
-  const commandLine = String(result.stdout ?? "");
   return commandLine.includes(marker) && commandLine.includes(token);
 }
 

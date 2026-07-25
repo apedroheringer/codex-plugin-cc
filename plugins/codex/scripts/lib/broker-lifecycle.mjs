@@ -8,6 +8,13 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import {
+  ensurePrivateDir,
+  PRIVATE_DIR_MODE,
+  PRIVATE_FILE_MODE,
+  setMode,
+  writeJsonFileAtomic
+} from "./fs.mjs";
 import { withLock } from "./locking.mjs";
 import {
   isProcessRunning,
@@ -22,21 +29,6 @@ import { resolveStateDir } from "./state.mjs";
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
-const PRIVATE_DIR_MODE = 0o700;
-const PRIVATE_FILE_MODE = 0o600;
-
-function setMode(filePath, mode) {
-  try {
-    fs.chmodSync(filePath, mode);
-  } catch {
-    // Windows and restrictive filesystems may not implement POSIX modes.
-  }
-}
-
-function ensurePrivateDir(dir) {
-  fs.mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR_MODE });
-  setMode(dir, PRIVATE_DIR_MODE);
-}
 
 export function createBrokerSessionDir(prefix = "cxc-") {
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -181,27 +173,7 @@ export function loadBrokerSession(cwd) {
 export function saveBrokerSession(cwd, session) {
   const stateDir = resolveStateDir(cwd);
   ensurePrivateDir(stateDir);
-  const stateFile = resolveBrokerStateFile(cwd);
-  const tmpFile = `${stateFile}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    const fd = fs.openSync(tmpFile, "wx", PRIVATE_FILE_MODE);
-    try {
-      setMode(tmpFile, PRIVATE_FILE_MODE);
-      fs.writeFileSync(fd, `${JSON.stringify(session, null, 2)}\n`, "utf8");
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    fs.renameSync(tmpFile, stateFile);
-    setMode(stateFile, PRIVATE_FILE_MODE);
-  } catch (error) {
-    try {
-      fs.unlinkSync(tmpFile);
-    } catch {
-      // Temp file may not have been created or may already be gone.
-    }
-    throw error;
-  }
+  writeJsonFileAtomic(resolveBrokerStateFile(cwd), session);
 }
 
 export function clearBrokerSession(cwd) {
@@ -374,6 +346,16 @@ async function canReclaimStaleEndpoint(session, pid, options = {}) {
   return !(await endpointAcceptsConnection(session.endpoint, options.reclaimProbeTimeoutMs));
 }
 
+function waitForBrokerProcessExit(pid, options, timeoutMs) {
+  return waitForProcessExit(pid, { ...options, timeoutMs });
+}
+
+function processMatchesInstanceToken(pid, instanceToken, options) {
+  return options.verifyProcess
+    ? options.verifyProcess(pid, instanceToken)
+    : processHasLaunchToken(pid, instanceToken, { ...options, marker: "--instance-token" });
+}
+
 export async function shutdownBrokerSession(cwd, options = {}) {
   const session = options.session ?? loadBrokerSession(cwd);
   if (!session) {
@@ -430,24 +412,10 @@ export async function shutdownBrokerSession(cwd, options = {}) {
   }
 
   let verifiedPid = ownershipVerified ? acknowledgedPid ?? pid : null;
-  let exited = isValidPid(pid)
-    ? await waitForProcessExit(pid, {
-        timeoutMs: 0,
-        intervalMs: options.intervalMs,
-        killImpl: options.killImpl,
-        platform: options.platform
-      })
-    : false;
+  let exited = isValidPid(pid) ? await waitForBrokerProcessExit(pid, options, 0) : false;
 
   if (!shutdownAck && isValidPid(pid) && !exited) {
-    const ownsPersistedProcess = options.verifyProcess
-      ? options.verifyProcess(pid, session.instanceToken)
-      : processHasLaunchToken(pid, session.instanceToken, {
-          marker: "--instance-token",
-          platform: options.platform,
-          timeoutMs: options.timeoutMs,
-          runCommandImpl: options.runCommandImpl
-        });
+    const ownsPersistedProcess = processMatchesInstanceToken(pid, session.instanceToken, options);
     if (!ownsPersistedProcess) {
       if (isProcessTreeRunning(pid, options)) {
         throw new Error("Codex app-server broker ownership could not be verified; persisted state was preserved.");
@@ -463,35 +431,22 @@ export async function shutdownBrokerSession(cwd, options = {}) {
   }
 
   if (!exited && isValidPid(verifiedPid)) {
-    exited = await waitForProcessExit(verifiedPid, {
-      timeoutMs: options.timeoutMs,
-      intervalMs: options.intervalMs,
-      killImpl: options.killImpl,
-      platform: options.platform
-    });
+    exited = await waitForBrokerProcessExit(verifiedPid, options, options.timeoutMs);
   }
 
   let forced = false;
   if (!exited && isValidPid(verifiedPid) && options.killProcess) {
-    const stillOwnsProcess = options.verifyProcess
-      ? options.verifyProcess(verifiedPid, session.instanceToken)
-      : processHasLaunchToken(verifiedPid, session.instanceToken, {
-          marker: "--instance-token",
-          platform: options.platform,
-          timeoutMs: options.timeoutMs,
-          runCommandImpl: options.runCommandImpl
-        });
+    const stillOwnsProcess = processMatchesInstanceToken(
+      verifiedPid,
+      session.instanceToken,
+      options
+    );
     if (!stillOwnsProcess) {
       throw new Error("Codex app-server broker process ownership changed before forced shutdown.");
     }
     options.killProcess(verifiedPid);
     forced = true;
-    exited = await waitForProcessExit(verifiedPid, {
-      timeoutMs: options.timeoutMs,
-      intervalMs: options.intervalMs,
-      killImpl: options.killImpl,
-      platform: options.platform
-    });
+    exited = await waitForBrokerProcessExit(verifiedPid, options, options.timeoutMs);
   }
 
   if (!exited) {

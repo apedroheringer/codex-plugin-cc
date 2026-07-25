@@ -18,6 +18,8 @@ import {
   shutdownBrokerSession
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import {
+  getProcessIdentity,
+  isProcessRunning,
   isProcessTreeRunning,
   terminateProcessTree,
   waitForProcessExit
@@ -897,5 +899,192 @@ test("ensureBrokerSession preserves session artifacts when the killed child does
     if (sessionDir) {
       fs.rmSync(sessionDir, { recursive: true, force: true });
     }
+  }
+});
+
+// Spawns a detached leader (its own process group) that binds the broker
+// endpoint socket and spawns a non-detached grandchild -- inheriting the
+// leader's process group, per standard POSIX fork/exec -- so the grandchild
+// keeps the group alive long after the leader itself is killed. This is the
+// exact "abandoned orphaned tree" shape CHANGE 1/2 exist to reclaim from: a
+// dead leader whose launch-token proof died with it, but whose process group
+// still has live, unrelated-looking members.
+async function spawnOrphanLeader(socketPath) {
+  const leader = spawn(
+    process.execPath,
+    [
+      "-e",
+      `const net = require("node:net");
+       const { spawn } = require("node:child_process");
+       const socketPath = ${JSON.stringify(socketPath)};
+       const grandchild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+       grandchild.unref();
+       grandchild.once("spawn", () => {
+         const server = net.createServer();
+         server.listen(socketPath, () => {
+           process.stdout.write("ready " + grandchild.pid + "\\n");
+         });
+       });
+       setInterval(() => {}, 60000);`
+    ],
+    { detached: true, stdio: ["ignore", "pipe", "ignore"] }
+  );
+  const grandchildPid = await new Promise((resolve, reject) => {
+    leader.stdout.on("data", (chunk) => {
+      const match = String(chunk).match(/ready (\d+)/);
+      if (match) {
+        resolve(Number(match[1]));
+      }
+    });
+    leader.once("error", reject);
+    leader.once("exit", () => reject(new Error("orphan leader exited before binding")));
+  });
+  return { leader, grandchildPid };
+}
+
+// Builds the abandoned-orphan fixture and persists a session for it. Passing
+// no instanceToken produces a legacy session (the key is omitted entirely,
+// matching how genuinely legacy sessions are built elsewhere in this file).
+async function setupOrphanedSession(workspace, { instanceToken } = {}) {
+  const sessionDir = makeTempDir("cxc-orphan-");
+  const socketPath = path.join(sessionDir, "broker.sock");
+  const pidFile = path.join(sessionDir, "broker.pid");
+
+  const { leader, grandchildPid } = await spawnOrphanLeader(socketPath);
+  const leaderPid = leader.pid;
+  fs.writeFileSync(pidFile, String(leaderPid));
+
+  // Captured while the leader is alive -- this is what
+  // ensureBrokerSessionLocked would have persisted at spawn time.
+  const recordedIdentity = getProcessIdentity(leaderPid);
+  assert.ok(recordedIdentity, "expected a recordable identity while the leader is alive");
+
+  const session = {
+    endpoint: `unix:${socketPath}`,
+    pid: leaderPid,
+    pidFile,
+    logFile: null,
+    sessionDir,
+    processIdentity: recordedIdentity,
+    ...(instanceToken !== undefined ? { instanceToken } : {})
+  };
+  saveBrokerSession(workspace, session);
+
+  // Kill only the leader: SIGKILL skips its own cleanup, so the socket file
+  // stays on disk with nothing listening, exactly like a crashed broker.
+  leader.kill("SIGKILL");
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline && isProcessRunning(leaderPid)) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(isProcessRunning(leaderPid), false, "the leader should have exited by now");
+  assert.equal(fs.existsSync(socketPath), true, "the stale socket must survive the leader's death");
+  assert.equal(isProcessTreeRunning(leaderPid), true, "the grandchild must keep the process group alive");
+
+  return { sessionDir, socketPath, pidFile, session, leaderPid, grandchildPid };
+}
+
+async function cleanupOrphanGroup(leaderPid, grandchildPid) {
+  try {
+    process.kill(-leaderPid, "SIGTERM");
+  } catch {
+    // Group may already be gone.
+  }
+  // The grandchild, not the (already dead) leader, is what a plain
+  // isProcessTreeRunning(grandchildPid) cannot see -- it inherited the
+  // leader's pgid rather than being a group leader itself -- so poll its own
+  // liveness directly (tree: false) instead.
+  let exited = await waitForProcessExit(grandchildPid, { timeoutMs: 2000, tree: false });
+  if (!exited) {
+    try {
+      process.kill(-leaderPid, "SIGKILL");
+    } catch {
+      // Already gone between the check above and here.
+    }
+    exited = await waitForProcessExit(grandchildPid, { timeoutMs: 2000, tree: false });
+  }
+  assert.equal(exited, true, "cleanup must confirm the test process exited");
+}
+
+test("shutdown reclaims a tokened session whose dead leader left an orphaned group", { skip: process.platform === "win32" }, async () => {
+  const workspace = makeTempDir();
+  const { socketPath, pidFile, leaderPid, grandchildPid } = await setupOrphanedSession(workspace, {
+    instanceToken: "orphan-leader-token"
+  });
+
+  let killProcessCalled = false;
+  const killProcess = () => {
+    killProcessCalled = true;
+  };
+
+  try {
+    const outcome = await shutdownBrokerSession(workspace, { timeoutMs: 40, killProcess });
+
+    assert.equal(killProcessCalled, false, "an abandoned orphaned tree must never be signaled");
+    assert.deepEqual(outcome, { found: true, exited: true, forced: false, reclaimedStaleEndpoint: true });
+    assert.equal(isProcessRunning(grandchildPid), true, "the grandchild must be left running untouched");
+    assert.equal(fs.existsSync(socketPath), false, "the stale socket must be removed");
+    assert.equal(fs.existsSync(pidFile), false, "the pid file must be removed");
+    assert.equal(loadBrokerSession(workspace), null);
+  } finally {
+    await cleanupOrphanGroup(leaderPid, grandchildPid);
+  }
+});
+
+test("ensureBrokerSession recovers after reclaiming an orphaned group", { skip: process.platform === "win32" }, async () => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const {
+    sessionDir: oldSessionDir,
+    socketPath: oldSocketPath,
+    session: oldSession,
+    leaderPid,
+    grandchildPid
+  } = await setupOrphanedSession(workspace, { instanceToken: "orphan-leader-token" });
+
+  try {
+    const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir) });
+
+    assert.ok(session, "ensureBrokerSession must recover instead of wedging on the orphaned tree");
+    assert.notEqual(session.pid, leaderPid);
+    assert.notEqual(session.sessionDir, oldSessionDir);
+    assert.notEqual(session.endpoint, oldSession.endpoint);
+
+    const probe = net.createConnection({ path: session.endpoint.slice("unix:".length) });
+    await new Promise((resolve, reject) => {
+      probe.once("connect", resolve);
+      probe.once("error", reject);
+    });
+    probe.destroy();
+
+    await shutdownBrokerSession(workspace, { killProcess: terminateProcessTree });
+    assert.equal(loadBrokerSession(workspace), null);
+
+    assert.equal(fs.existsSync(oldSocketPath), false, "the reclaimed stale socket must have been removed");
+    assert.equal(isProcessRunning(grandchildPid), true, "the orphaned grandchild must be left running throughout");
+  } finally {
+    await cleanupOrphanGroup(leaderPid, grandchildPid);
+  }
+});
+
+test("a legacy orphaned group still preserves state", { skip: process.platform === "win32" }, async () => {
+  const workspace = makeTempDir();
+  // No instanceToken: pins the CHANGE 1/2 relaxation strictly to the tokened
+  // path -- a legacy session hitting the identical dead-leader/live-group
+  // shape must still refuse and preserve state.
+  const { socketPath, leaderPid, grandchildPid } = await setupOrphanedSession(workspace);
+
+  try {
+    await assert.rejects(
+      shutdownBrokerSession(workspace, { timeoutMs: 40, killProcess: terminateProcessTree }),
+      /ownership could not be verified/i
+    );
+
+    assert.equal(fs.existsSync(socketPath), true, "the socket must be preserved for a legacy orphaned group");
+    assert.ok(loadBrokerSession(workspace), "broker.json must be preserved for a legacy orphaned group");
+  } finally {
+    await cleanupOrphanGroup(leaderPid, grandchildPid);
   }
 });

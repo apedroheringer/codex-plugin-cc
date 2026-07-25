@@ -332,22 +332,37 @@ function processMatchesLegacyBroker(session, pid, options = {}) {
  * instead, all of which must hold:
  *
  *   1. the socket sits inside the 0700 session directory we created;
- *   2. neither the recorded PID nor its process group is still running;
+ *   2. the recorded leader is absent or replaced (see below for the
+ *      process-group exception);
  *   3. connecting to the endpoint is refused.
  *
  * No single one is sufficient. A hung broker also fails to answer, PID numbers
  * get reused, and a refused connect only proves nothing is listening *right
  * now* — a process that has bound but not yet listened also refuses. Requiring
  * all three keeps the blast radius inside our own temp directory.
+ *
+ * `allowOrphanedTree` (default false) relaxes signal 2 from "process group
+ * gone" to "leader gone": the caller passes it only after already having
+ * established the abandoned-tokened-orphan state itself (a confirmed-dead or
+ * -replaced leader whose group still has members we deliberately never
+ * signal). It is safe here specifically because signal 3 still independently
+ * rules out any live listener on the endpoint, and a surviving group member
+ * never knew the socket path to begin with -- it was never handed the
+ * endpoint, so it cannot be the one refusing or accepting the connection.
+ * Legacy callers do not set the flag and keep the full process-group veto.
  */
 async function canReclaimStaleEndpoint(session, pid, options = {}) {
   if (!endpointBelongsToSession(session, options.platform)) {
     return false;
   }
+  if (isValidPid(pid) && isProcessRunning(pid, options)) {
+    return false;
+  }
   // isProcessTreeRunning() checks the process *group* on Linux, so a reused PID
-  // in another group reads as dead. Pair it with the plain PID check before
-  // treating the owner as gone.
-  if (isValidPid(pid) && (isProcessTreeRunning(pid, options) || isProcessRunning(pid, options))) {
+  // in another group reads as dead. Pair it with the plain PID check above
+  // before treating the owner as gone -- unless the caller has already
+  // established the abandoned-orphan exception documented above.
+  if (!options.allowOrphanedTree && isValidPid(pid) && isProcessTreeRunning(pid, options)) {
     return false;
   }
   return !(await endpointAcceptsConnection(session.endpoint, options.reclaimProbeTimeoutMs));
@@ -389,6 +404,11 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
       ? session.processIdentity
       : null;
   const livenessOptions = recordedIdentity != null ? { ...options, identity: recordedIdentity } : options;
+  // Set when the persisted leader is confirmed gone (or replaced) while its
+  // process group still has survivors -- an abandoned, tokened orphan whose
+  // own state we may still reclaim without ever signaling the group. See the
+  // ownership-check branch below for the full rationale.
+  let abandonedOrphanedTree = false;
   const legacySession = Boolean(session.endpoint && !session.instanceToken);
   let legacyProcessVerified = false;
   if (legacySession) {
@@ -441,7 +461,21 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
     const ownsPersistedProcess = ownsBrokerProcess(session, pid, legacySession, options);
     if (!ownsPersistedProcess) {
       if (isProcessTreeRunning(pid, livenessOptions)) {
-        throw new Error("Codex app-server broker ownership could not be verified; persisted state was preserved.");
+        if (!session.instanceToken || isProcessRunning(pid, livenessOptions)) {
+          throw new Error("Codex app-server broker ownership could not be verified; persisted state was preserved.");
+        }
+        // The leader is confirmed gone (or provably replaced) while its process
+        // group still has members. POSIX reserves a leader's pid for as long as
+        // the group survives, but a single observation cannot tell whether these
+        // members are the original broker's descendants or a later generation
+        // that recycled the same pgid after the original group died out -- so
+        // the group is deliberately never signaled. Reclaiming our own session
+        // state is still sound: nothing can be accepting on a refused endpoint,
+        // and the orphaned tree (which may still be finishing in-flight work,
+        // not necessarily idle) keeps running untouched. The alternative is
+        // wedging every later invocation in this workspace until the orphan
+        // exits on its own.
+        abandonedOrphanedTree = true;
       }
       exited = true;
     } else {
@@ -483,7 +517,10 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   const endpointProven = ownershipVerified || processOwnershipProven;
   let reclaimedStaleEndpoint = false;
   if (!endpointProven && endpointArtifactExists(session.endpoint)) {
-    reclaimedStaleEndpoint = await canReclaimStaleEndpoint(session, pid, livenessOptions);
+    reclaimedStaleEndpoint = await canReclaimStaleEndpoint(session, pid, {
+      ...livenessOptions,
+      allowOrphanedTree: abandonedOrphanedTree
+    });
     if (!reclaimedStaleEndpoint) {
       throw new Error("Codex app-server broker endpoint ownership could not be verified; persisted state was preserved.");
     }

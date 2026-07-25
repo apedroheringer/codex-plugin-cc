@@ -336,9 +336,7 @@ async function canReclaimStaleEndpoint(session, pid, options = {}) {
 }
 
 function processMatchesInstanceToken(pid, instanceToken, options) {
-  return options.verifyProcess
-    ? options.verifyProcess(pid, instanceToken)
-    : processHasLaunchToken(pid, instanceToken, { ...options, marker: "--instance-token" });
+  return processHasLaunchToken(pid, instanceToken, { ...options, marker: "--instance-token" });
 }
 
 // Legacy sessions have no instance token, so their processes are re-verified

@@ -39,6 +39,19 @@ test("Linux zombie processes are treated as exited even when signal 0 succeeds",
   assert.equal(running, false);
 });
 
+test("Linux processes with unreadable /proc metadata stay running", () => {
+  const running = isProcessRunning(1234, {
+    platform: "linux",
+    identity: "42",
+    killImpl() {},
+    readProcessStat() {
+      return null;
+    }
+  });
+
+  assert.equal(running, true);
+});
+
 test("macOS process identity uses the process start time", () => {
   let captured = null;
   const identity = getProcessIdentity(1234, {

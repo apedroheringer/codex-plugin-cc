@@ -140,15 +140,17 @@ export function isProcessRunning(pid, options = {}) {
   if (platform === "linux") {
     const readProcessStat = options.readProcessStat ?? readLinuxProcessStat;
     const stat = readProcessStat(pid);
-    if (!stat) {
-      return false;
-    }
-    // Zombies still answer kill(pid, 0), but no longer own a live resource.
-    if (stat.state === "Z" || stat.state === "X") {
-      return false;
-    }
-    if (options.identity != null && stat.startTime !== String(options.identity)) {
-      return false;
+    // A null stat means /proc could not be inspected even though kill(pid, 0)
+    // proved the process exists. Failure to inspect is not proof of exit or
+    // replacement, so stay conservative and keep reporting it as running.
+    if (stat) {
+      // Zombies still answer kill(pid, 0), but no longer own a live resource.
+      if (stat.state === "Z" || stat.state === "X") {
+        return false;
+      }
+      if (options.identity != null && stat.startTime !== String(options.identity)) {
+        return false;
+      }
     }
   } else if (options.identity != null) {
     const currentIdentity = getProcessIdentity(pid, options);

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import test from "node:test";
@@ -535,6 +536,29 @@ test("ensureBrokerSession recovers from a stale socket instead of failing", { sk
 
   assert.ok(session, "a stale socket must not block the replacement broker");
   assert.notEqual(session.endpoint, `unix:${socketPath}`);
+});
+
+test("ensureBrokerSession fails cleanly when the broker process cannot spawn", async () => {
+  const workspace = makeTempDir();
+  // spawn() launches the broker with `cwd` as the child's working directory.
+  // Deleting it after makeTempDir() reproduces a workspace that vanishes
+  // between the caller's check and the spawn: Node cannot fail synchronously
+  // here, it emits an asynchronous "error" event (ENOENT) instead.
+  fs.rmSync(workspace, { recursive: true, force: true });
+
+  const before = new Set(fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("cxc-")));
+
+  await assert.rejects(() => ensureBrokerSession(workspace, { env: process.env }), /failed to spawn/);
+
+  assert.equal(
+    loadBrokerSession(workspace),
+    null,
+    "a spawn failure must never persist a tokenized session with pid: null, or shutdown wedges permanently"
+  );
+
+  const after = new Set(fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("cxc-")));
+  const leaked = [...after].filter((name) => !before.has(name));
+  assert.deepEqual(leaked, [], "the failed attempt's temporary session directory must not be left behind");
 });
 
 test("shutdown still refuses to unlink an endpoint someone is listening on", { skip: process.platform === "win32" }, async (t) => {

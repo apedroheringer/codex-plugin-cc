@@ -172,6 +172,19 @@ function spawnBrokerProcess({
   }
 }
 
+// child_process.spawn() can fail asynchronously (e.g. ENOENT when `cwd` does
+// not exist): Node emits an "error" event on the next tick instead of
+// throwing. Without a listener that event crashes the process, and callers
+// that raced ahead to persist a tokenized session would leave a wedged
+// broker.json (pid: null) behind. Callers must await this before treating the
+// child as spawned.
+function waitForBrokerSpawn(child) {
+  return new Promise((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
+}
+
 function resolveBrokerStateFile(cwd) {
   return path.join(resolveStateDir(cwd), BROKER_STATE_FILE);
 }
@@ -507,6 +520,25 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
     instanceToken,
     env: options.env ?? process.env
   });
+
+  // Persistence is deferred until the spawn is confirmed, so a session that
+  // never actually started never gets written with pid: null + a live
+  // instanceToken — that combination poisons shutdownBrokerSessionLocked()
+  // for every later invocation against this cwd (it throws "PID is
+  // unavailable" before any reclaim path runs), wedging the workspace.
+  try {
+    await waitForBrokerSpawn(child);
+  } catch (error) {
+    teardownBrokerSession({
+      pidFile,
+      logFile,
+      sessionDir,
+      ownershipVerified: false
+    });
+    throw new Error(
+      `Codex app-server broker failed to spawn: ${error?.message ?? "unknown error"}`
+    );
+  }
 
   const session = {
     endpoint,

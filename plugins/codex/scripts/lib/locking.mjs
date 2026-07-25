@@ -68,13 +68,16 @@ function tryAcquire(lockDir) {
     candidateOwnerFile
   };
 
+  // Resolve identity before creating the candidate so a crash during a slow
+  // ps/PowerShell lookup cannot leave an orphaned candidate directory behind.
+  const identity = cachedProcessIdentity();
   fs.mkdirSync(candidateDir, { mode: 0o700 });
   try {
     writePrivateJson(candidateOwnerFile, {
       pid: process.pid,
       token,
       createdAt: Date.now(),
-      processIdentity: cachedProcessIdentity()
+      processIdentity: identity
     });
     fs.renameSync(candidateDir, lockDir);
     return handle;
@@ -162,9 +165,11 @@ function reclaimAbandonedLock(lockDir, options) {
         identity: processIdentity ?? undefined
       })
     ) {
-      // Older locks on macOS and Windows did not record a process identity.
-      // Once such a short-lived critical section is stale, a live PID alone
-      // cannot distinguish the original owner from an unrelated reused PID.
+      // When the identity lookup failed at acquire time the owner records
+      // null. Once such a short-lived critical section looks stale, a live
+      // PID alone cannot distinguish the original owner from an unrelated
+      // process that reused the PID, so reclaiming is the lesser risk:
+      // refusing would wedge every later caller behind a reused PID.
       if (processIdentity == null && state.ageMs > options.staleMs) {
         return removeOwnedLock(state.ownerFile, lockDir);
       }

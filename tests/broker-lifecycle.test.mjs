@@ -688,3 +688,68 @@ test("an endpoint outside the plugin session directory is never reclaimed", { sk
   assert.equal(fs.existsSync(socketPath), true, "foreign socket must survive");
   fs.unlinkSync(socketPath);
 });
+
+test("shutdown aborts instead of silently skipping an unreadable pid file", async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-unreadable-pid-");
+  const pidFile = path.join(sessionDir, "broker.pid");
+  // A directory at the pid file path makes the read fail with EISDIR instead
+  // of ENOENT, exercising the "any other failure must abort" branch of
+  // resolveBrokerPid() rather than the "file genuinely absent" branch.
+  fs.mkdirSync(pidFile);
+
+  // Deliberately no instanceToken: this session can never be cleaned up
+  // through shutdownBrokerSession() (the unreadable pid file always aborts
+  // it, by design), so it must stay invisible to the global owned-broker
+  // teardown in tests/helpers.mjs, which only acts on sessions carrying one.
+  const session = {
+    endpoint: `unix:${path.join(sessionDir, "broker.sock")}`,
+    pid: null,
+    pidFile,
+    logFile: null,
+    sessionDir
+  };
+  saveBrokerSession(workspace, session);
+
+  await assert.rejects(
+    shutdownBrokerSession(workspace, { timeoutMs: 40 }),
+    (error) => error?.code === "EISDIR"
+  );
+
+  assert.deepEqual(loadBrokerSession(workspace), session);
+});
+
+test("ensureBrokerSession tears down a spawned child when persisting the session fails", { skip: process.platform === "win32" }, async () => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(stateDir, { recursive: true });
+  // Occupies the broker.json path with a directory so saveBrokerSession's
+  // rename-into-place fails with EISDIR only after the child has already
+  // spawned successfully.
+  const brokerStateFile = path.join(stateDir, "broker.json");
+  fs.mkdirSync(brokerStateFile);
+
+  const killedPids = [];
+  const killProcess = (pid) => {
+    killedPids.push(pid);
+    return terminateProcessTree(pid);
+  };
+
+  const before = new Set(fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("cxc-")));
+
+  await assert.rejects(ensureBrokerSession(workspace, { env: buildEnv(binDir), killProcess }));
+
+  assert.equal(killedPids.length, 1, "the spawned child must be killed exactly once");
+  assert.ok(Number.isSafeInteger(killedPids[0]) && killedPids[0] > 0);
+
+  const after = new Set(fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("cxc-")));
+  const leaked = [...after].filter((name) => !before.has(name));
+  assert.deepEqual(leaked, [], "the session directory of the failed persist must not be left behind");
+
+  assert.equal(loadBrokerSession(workspace), null);
+  assert.equal(fs.existsSync(brokerStateFile), true, "the blocking directory itself is left untouched");
+  assert.equal(fs.statSync(brokerStateFile).isDirectory(), true);
+});

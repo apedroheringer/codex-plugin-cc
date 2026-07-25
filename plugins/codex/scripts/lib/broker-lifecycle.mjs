@@ -214,8 +214,12 @@ function resolveBrokerPid(session) {
   if (session.pidFile) {
     try {
       rawPid = fs.readFileSync(session.pidFile, "utf8").trim();
-    } catch {
-      // A pid file that vanished or cannot be read is treated as absent.
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+      // A pid file that vanished is treated as absent; any other failure is
+      // an integrity problem and must abort instead of masking a mismatch.
     }
   }
   if (rawPid !== null && /^\d+$/.test(rawPid)) {
@@ -548,7 +552,26 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
     pid: child.pid ?? null,
     instanceToken
   };
-  saveBrokerSession(cwd, session);
+  try {
+    saveBrokerSession(cwd, session);
+  } catch (error) {
+    // The spawn already succeeded, so a failed persist would otherwise leave
+    // an untracked broker running with no state pointing at it.
+    try {
+      shutdownOptions.killProcess(child.pid);
+    } catch {
+      // Teardown must still run and the original persist error must still
+      // surface; a failure to kill the child is secondary to both.
+    }
+    teardownBrokerSession({
+      endpoint,
+      pidFile,
+      logFile,
+      sessionDir,
+      ownershipVerified: true
+    });
+    throw error;
+  }
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {

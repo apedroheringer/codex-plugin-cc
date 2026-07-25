@@ -177,13 +177,8 @@ function resolveBrokerStateFile(cwd) {
 }
 
 export function loadBrokerSession(cwd) {
-  const stateFile = resolveBrokerStateFile(cwd);
-  if (!fs.existsSync(stateFile)) {
-    return null;
-  }
-
   try {
-    return JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    return JSON.parse(fs.readFileSync(resolveBrokerStateFile(cwd), "utf8"));
   } catch {
     return null;
   }
@@ -228,8 +223,8 @@ function endpointArtifactExists(endpoint) {
   }
 }
 
-function canDiscardUnownedSession(session, pid) {
-  const processExited = !isValidPid(pid) || !isProcessTreeRunning(pid);
+function canDiscardUnownedSession(session, pid, options = {}) {
+  const processExited = !isValidPid(pid) || !isProcessTreeRunning(pid, options);
   return processExited && !endpointArtifactExists(session.endpoint);
 }
 
@@ -359,7 +354,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   const legacySession = Boolean(session.endpoint && !session.instanceToken);
   let legacyProcessVerified = false;
   if (legacySession) {
-    if (canDiscardUnownedSession(session, pid)) {
+    if (canDiscardUnownedSession(session, pid, options)) {
       teardownBrokerSession({
         endpoint: null,
         pidFile: session.pidFile ?? null,

@@ -8,7 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
-import { ensurePrivateDir, writePrivateFile } from "./lib/fs.mjs";
+import { ensurePrivateDir, removeFileIfExists, writePrivateFile } from "./lib/fs.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -116,12 +116,10 @@ async function main() {
     }
     await appClient.close().catch(() => {});
     await new Promise((resolve) => server.close(resolve));
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
+    if (listenTarget.kind === "unix") {
+      removeFileIfExists(listenTarget.path);
     }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
-    }
+    removeFileIfExists(pidFile);
   }
 
   appClient.setNotificationHandler(routeNotification);
@@ -254,15 +252,12 @@ async function main() {
     });
   });
 
-  process.on("SIGTERM", async () => {
-    await shutdown(server);
-    process.exit(0);
-  });
-
-  process.on("SIGINT", async () => {
-    await shutdown(server);
-    process.exit(0);
-  });
+  for (const signal of ["SIGTERM", "SIGINT"]) {
+    process.on(signal, async () => {
+      await shutdown(server);
+      process.exit(0);
+    });
+  }
 
   server.listen(listenTarget.path);
 }

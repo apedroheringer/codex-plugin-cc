@@ -9,6 +9,7 @@ import { spawn } from "node:child_process";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { makeTempDir } from "./helpers.mjs";
+import { createBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import {
   ensureBrokerSession,
   loadBrokerSession,
@@ -18,7 +19,8 @@ import {
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import {
   isProcessTreeRunning,
-  terminateProcessTree
+  terminateProcessTree,
+  waitForProcessExit
 } from "../plugins/codex/scripts/lib/process.mjs";
 import {
   acquireLock,
@@ -738,18 +740,162 @@ test("ensureBrokerSession tears down a spawned child when persisting the session
     return terminateProcessTree(pid);
   };
 
-  const before = new Set(fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("cxc-")));
+  // Capture the exact session directory ensureBrokerSessionLocked creates
+  // via the same injection point other tests use, instead of diffing
+  // os.tmpdir() -- concurrent test files also create cxc-* directories, so a
+  // tmpdir-wide before/after snapshot races with them.
+  let capturedSessionDir = null;
+  const createBrokerEndpointSpy = (sessionDir, platform) => {
+    capturedSessionDir = sessionDir;
+    return createBrokerEndpoint(sessionDir, platform);
+  };
 
-  await assert.rejects(ensureBrokerSession(workspace, { env: buildEnv(binDir), killProcess }));
+  await assert.rejects(
+    ensureBrokerSession(workspace, { env: buildEnv(binDir), killProcess, createBrokerEndpoint: createBrokerEndpointSpy })
+  );
 
   assert.equal(killedPids.length, 1, "the spawned child must be killed exactly once");
   assert.ok(Number.isSafeInteger(killedPids[0]) && killedPids[0] > 0);
 
-  const after = new Set(fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("cxc-")));
-  const leaked = [...after].filter((name) => !before.has(name));
-  assert.deepEqual(leaked, [], "the session directory of the failed persist must not be left behind");
+  assert.ok(capturedSessionDir, "ensureBrokerSession must have created a session directory");
+  assert.equal(
+    fs.existsSync(capturedSessionDir),
+    false,
+    "the session directory of the failed persist must not be left behind"
+  );
 
   assert.equal(loadBrokerSession(workspace), null);
   assert.equal(fs.existsSync(brokerStateFile), true, "the blocking directory itself is left untouched");
   assert.equal(fs.statSync(brokerStateFile).isDirectory(), true);
+});
+
+test("shutdown treats a reused PID as exited once the recorded identity stops matching", { skip: process.platform === "win32" }, async (t) => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-reused-pid-");
+  const socketPath = path.join(sessionDir, "broker.sock");
+
+  // A detached process is its own process-group leader (unlike this test's
+  // own process under `node --test`, which is not) -- exactly the shape of
+  // an impostor that reused a dead broker's PID and became an unrelated new
+  // group leader. Its real identity can never equal the bogus one recorded
+  // below, so liveness must be resolved from session.processIdentity rather
+  // than group membership alone, which would otherwise read it as running.
+  const dummy = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: true,
+    stdio: "ignore"
+  });
+  await new Promise((resolve, reject) => {
+    dummy.once("spawn", resolve);
+    dummy.once("error", reject);
+  });
+  t.after(async () => {
+    if (!isProcessTreeRunning(dummy.pid)) {
+      return;
+    }
+    terminateProcessTree(dummy.pid);
+    let exited = await waitForProcessExit(dummy.pid, { timeoutMs: 2000 });
+    if (!exited) {
+      try {
+        process.kill(-dummy.pid, "SIGKILL");
+      } catch {
+        // Already gone between the check above and here.
+      }
+      exited = await waitForProcessExit(dummy.pid, { timeoutMs: 2000 });
+    }
+    assert.equal(exited, true, "cleanup must confirm the test process exited");
+  });
+
+  const session = {
+    endpoint: `unix:${socketPath}`,
+    pid: dummy.pid,
+    pidFile: null,
+    logFile: null,
+    sessionDir,
+    instanceToken: "reused-pid-token",
+    processIdentity: "reused-pid-identity-mismatch"
+  };
+  saveBrokerSession(workspace, session);
+
+  const outcome = await shutdownBrokerSession(workspace, { timeoutMs: 40 });
+
+  assert.equal(outcome.found, true);
+  assert.equal(outcome.exited, true);
+  assert.equal(outcome.forced, false);
+  assert.equal(loadBrokerSession(workspace), null);
+});
+
+test("ensureBrokerSession preserves session artifacts when the killed child does not actually exit", { skip: process.platform === "win32" }, async () => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(stateDir, { recursive: true });
+  // Same EISDIR trigger as the sibling test above, just paired here with a
+  // killProcess that does not actually stop the child, to exercise the
+  // "kill was denied or too slow" branch of the failed-persist unwind.
+  const brokerStateFile = path.join(stateDir, "broker.json");
+  fs.mkdirSync(brokerStateFile);
+
+  let killedPid = null;
+  const killProcess = (pid) => {
+    killedPid = pid;
+    // Deliberately a no-op: simulates a kill signal that was denied or did
+    // not land in time. The child stays alive.
+  };
+
+  // Capture the exact session directory via the same injection point other
+  // tests use, instead of diffing os.tmpdir() -- concurrent test files also
+  // create cxc-* directories, so a tmpdir-wide before/after snapshot races
+  // with them.
+  let sessionDir = null;
+  const createBrokerEndpointSpy = (dir, platform) => {
+    sessionDir = dir;
+    return createBrokerEndpoint(dir, platform);
+  };
+
+  try {
+    await assert.rejects(
+      ensureBrokerSession(workspace, {
+        env: buildEnv(binDir),
+        killProcess,
+        timeoutMs: 150,
+        createBrokerEndpoint: createBrokerEndpointSpy
+      }),
+      /did not exit.*artifacts were preserved/i
+    );
+
+    assert.ok(Number.isSafeInteger(killedPid) && killedPid > 0, "killProcess must have been invoked with the child pid");
+    assert.equal(isProcessTreeRunning(killedPid), true, "the child must still be alive for this branch to be exercised");
+
+    assert.ok(sessionDir, "ensureBrokerSession must have created a session directory");
+    assert.equal(fs.existsSync(sessionDir), true, "the session directory must not be torn down while the child is still alive");
+
+    assert.equal(fs.existsSync(brokerStateFile), true, "the blocking directory itself is left untouched");
+    assert.equal(fs.statSync(brokerStateFile).isDirectory(), true);
+  } finally {
+    // The injected killProcess deliberately did nothing, so the real child is
+    // still running: terminate and reap it for real before the test exits,
+    // then remove the preserved session directory ourselves so this test's
+    // deliberate leak does not confuse the leak-detection windows of other
+    // tests running in the same tmpdir. Only rmSync after confirming exit --
+    // otherwise a still-alive process could recreate files under sessionDir
+    // after we remove it.
+    if (killedPid) {
+      terminateProcessTree(killedPid);
+      let exited = await waitForProcessExit(killedPid, { timeoutMs: 2000 });
+      if (!exited) {
+        try {
+          process.kill(-killedPid, "SIGKILL");
+        } catch {
+          // Already gone between the check above and here.
+        }
+        exited = await waitForProcessExit(killedPid, { timeoutMs: 2000 });
+      }
+      assert.equal(exited, true, "cleanup must confirm the test process exited");
+    }
+    if (sessionDir) {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+  }
 });

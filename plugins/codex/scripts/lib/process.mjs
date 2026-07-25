@@ -87,7 +87,16 @@ function readLinuxProcessStat(pid) {
 
 function queryProcessTable(pid, powershellCommand, psFormat, options) {
   const runCommandImpl = options.runCommandImpl ?? runCommand;
-  const spawnOptions = { timeout: options.timeoutMs ?? 2000, killSignal: "SIGTERM" };
+  const spawnOptions = {
+    timeout: options.timeoutMs ?? 2000,
+    killSignal: "SIGTERM",
+    // ps -o lstart= renders via the C library's %c, which is locale- and
+    // TZ-dependent: the same instant can print differently between the
+    // recording and the checking invocation, producing a false mismatch on a
+    // still-live broker. Force a fixed, unambiguous rendering. Harmless for
+    // the PowerShell path (already UTC ticks) and for command-line reads.
+    env: { ...(options.env ?? process.env), LC_ALL: "C", TZ: "UTC" }
+  };
   const result =
     (options.platform ?? process.platform) === "win32"
       ? runCommandImpl(
@@ -102,12 +111,46 @@ function queryProcessTable(pid, powershellCommand, psFormat, options) {
   return String(result.stdout ?? "");
 }
 
+// /proc/<pid>/stat's starttime is in clock ticks since BOOT, not since the
+// epoch, so the bare value collides across reboots (a reused pid after a
+// reboot can present the same tick count as an earlier, unrelated process).
+// Prefixing with the boot id disambiguates across reboots while keeping
+// identities comparable within one. Read once and cache for the process
+// lifetime -- it cannot change without a reboot, which also invalidates any
+// identity recorded before it. Only a SUCCESSFUL read is cached: a transient
+// failure (e.g. a sandboxed /proc) must not poison every later call for the
+// rest of the process's lifetime -- each subsequent call gets another chance
+// to read it.
+let cachedBootId;
+function bootId() {
+  if (cachedBootId === undefined) {
+    try {
+      cachedBootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    } catch {
+      return "";
+    }
+  }
+  return cachedBootId;
+}
+
 export function getProcessIdentity(pid, options = {}) {
   if (!isValidPid(pid)) {
     return null;
   }
   if ((options.platform ?? process.platform) === "linux") {
-    return readLinuxProcessStat(pid)?.startTime ?? null;
+    const startTime = readLinuxProcessStat(pid)?.startTime ?? null;
+    if (startTime == null) {
+      return null;
+    }
+    const boot = bootId();
+    if (!boot) {
+      // boot_id unreadable: a raw tick count is boot-relative and would both
+      // collide across boots and falsely mismatch against composite values
+      // recorded when boot_id WAS readable. Unknown must never masquerade
+      // as a comparable identity.
+      return null;
+    }
+    return `${boot}:${startTime}`;
   }
   const output = queryProcessTable(
     pid,
@@ -148,8 +191,25 @@ export function isProcessRunning(pid, options = {}) {
       if (stat.state === "Z" || stat.state === "X") {
         return false;
       }
-      if (options.identity != null && stat.startTime !== String(options.identity)) {
-        return false;
+      if (options.identity != null) {
+        // getProcessIdentity() prefixes Linux identities with the boot id
+        // (see its comment); build the same composite here so this direct
+        // stat.startTime comparison stays consistent with values recorded
+        // through getProcessIdentity(). Only compare when boot_id is
+        // currently readable and the composite can actually be formed --
+        // a bare tick count is boot-relative and must never be compared
+        // directly, which would both collide across boots and falsely
+        // mismatch a still-live process against a composite identity
+        // recorded when boot_id WAS readable.
+        const boot = bootId();
+        if (boot) {
+          const currentIdentity = `${boot}:${stat.startTime}`;
+          if (currentIdentity !== String(options.identity)) {
+            return false;
+          }
+        }
+        // boot_id unreadable right now: the comparison cannot be formed, so
+        // it proves nothing. Failure to inspect is not proof of replacement.
       }
     }
   } else if (options.identity != null) {
@@ -193,6 +253,19 @@ export function isProcessTreeRunning(pid, options = {}) {
   const platform = options.platform ?? process.platform;
   if (platform === "win32") {
     return isProcessRunning(pid, options);
+  }
+  if (options.identity != null) {
+    const currentIdentity = getProcessIdentity(pid, options);
+    if (currentIdentity != null && currentIdentity !== String(options.identity)) {
+      // The pid exists and belongs to a different process. POSIX keeps a group
+      // leader's pid reserved while its group still has members, so a confirmed
+      // replacement also proves the recorded group is gone.
+      return false;
+    }
+    // An absent or unreadable pid proves nothing about survivors in its group;
+    // fall through to the group checks below. In particular, a leader that
+    // has already exited (identity now unreadable) must not short-circuit
+    // here: its process group can still have live descendants.
   }
   if (platform === "linux" && !options.killImpl) {
     return isLinuxProcessGroupRunning(pid);

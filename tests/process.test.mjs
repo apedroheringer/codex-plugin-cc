@@ -1,14 +1,17 @@
 import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 
 import {
   getProcessIdentity,
   isProcessRunning,
+  isProcessTreeRunning,
   processHasLaunchSequence,
   runCommand,
   runCommandChecked,
-  terminateProcessTree
+  terminateProcessTree,
+  waitForProcessExit
 } from "../plugins/codex/scripts/lib/process.mjs";
 
 const SELF_TERMINATING_SCRIPT = "process.kill(process.pid, 'SIGTERM'); setInterval(() => {}, 1000);";
@@ -198,4 +201,68 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
   assert.equal(outcome.method, "taskkill");
   assert.equal(outcome.result.status, 128);
   assert.match(outcome.result.stdout, /not found/i);
+});
+
+test("a dead group leader with a surviving descendant still counts as a running tree", { skip: process.platform === "win32" }, async () => {
+  // The leader spawns a grandchild without detaching it: an un-detached
+  // child inherits its parent's process group (standard POSIX fork/exec
+  // behavior), so the grandchild keeps the leader's original group alive
+  // long after the leader itself has exited and been reaped.
+  const leaderScript = `
+    const { spawn } = require("node:child_process");
+    const grandchild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+    grandchild.unref();
+    setTimeout(() => process.exit(0), 200);
+  `;
+  const leader = spawn(process.execPath, ["-e", leaderScript], {
+    detached: true,
+    stdio: "ignore"
+  });
+  await new Promise((resolve, reject) => {
+    leader.once("spawn", resolve);
+    leader.once("error", reject);
+  });
+  const leaderPid = leader.pid;
+
+  try {
+    const recordedIdentity = getProcessIdentity(leaderPid);
+    assert.ok(recordedIdentity, "expected a recordable identity while the leader is alive");
+
+    // Poll for the leader's own exit instead of a fixed sleep: its script
+    // exits itself after ~200ms, but scheduling jitter under test-suite load
+    // must not make this flaky.
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && isProcessRunning(leaderPid)) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(isProcessRunning(leaderPid), false, "the leader should have exited and been reaped by now");
+
+    // The leader is gone, but the grandchild it left behind is still in the
+    // leader's original process group. A live descendant must still read as
+    // a running tree, matched against the identity recorded while the
+    // leader itself was alive.
+    assert.equal(
+      isProcessTreeRunning(leaderPid, { identity: recordedIdentity }),
+      true,
+      "a surviving descendant must keep the recorded process group alive"
+    );
+  } finally {
+    // The leader is already dead; -leaderPid still addresses the process
+    // group as long as at least one member (the grandchild) survives.
+    try {
+      process.kill(-leaderPid, "SIGTERM");
+    } catch {
+      // Group may already be gone.
+    }
+    let exited = await waitForProcessExit(leaderPid, { timeoutMs: 2000 });
+    if (!exited) {
+      try {
+        process.kill(-leaderPid, "SIGKILL");
+      } catch {
+        // Already gone between the check above and here.
+      }
+      exited = await waitForProcessExit(leaderPid, { timeoutMs: 2000 });
+    }
+    assert.equal(exited, true, "cleanup must confirm the test process exited");
+  }
 });

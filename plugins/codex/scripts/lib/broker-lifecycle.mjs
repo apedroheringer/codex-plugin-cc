@@ -18,6 +18,7 @@ import {
 } from "./fs.mjs";
 import { withLock } from "./locking.mjs";
 import {
+  getProcessIdentity,
   isProcessRunning,
   isProcessTreeRunning,
   isValidPid,
@@ -375,16 +376,29 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   }
 
   const pid = resolveBrokerPid(session);
+  // Liveness/exit checks against the persisted pid must be pinned to the
+  // process identity recorded at spawn time (when available), so a reused
+  // PID reads as exited instead of being mistaken for the original broker.
+  // Ownership checks (token or launch-artifact matching) are a separate,
+  // stronger proof and are deliberately left on the caller-supplied options.
+  // `!= null` alone would also accept "" or a non-string value that
+  // String()-coerces to something no live process could ever match, which
+  // would misread a live broker as replaced -- validate the shape first.
+  const recordedIdentity =
+    typeof session.processIdentity === "string" && session.processIdentity.length > 0
+      ? session.processIdentity
+      : null;
+  const livenessOptions = recordedIdentity != null ? { ...options, identity: recordedIdentity } : options;
   const legacySession = Boolean(session.endpoint && !session.instanceToken);
   let legacyProcessVerified = false;
   if (legacySession) {
-    if (canDiscardUnownedSession(session, pid, options)) {
+    if (canDiscardUnownedSession(session, pid, livenessOptions)) {
       teardownAndClear(cwd, session, false);
       return { found: true, exited: true, forced: false, reclaimedStaleEndpoint: false };
     }
     legacyProcessVerified = processMatchesLegacyBroker(session, pid, options);
     const legacyEndpointIsSafelyStale =
-      isValidPid(pid) && (await canReclaimStaleEndpoint(session, pid, options));
+      isValidPid(pid) && (await canReclaimStaleEndpoint(session, pid, livenessOptions));
     if (!legacyProcessVerified && !legacyEndpointIsSafelyStale) {
       throw new Error("Codex app-server broker ownership could not be verified; persisted state was preserved.");
     }
@@ -418,13 +432,15 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   }
 
   let verifiedPid = ownershipVerified ? acknowledgedPid ?? pid : null;
-  let exited = isValidPid(pid) ? await waitForProcessExit(pid, { ...options, timeoutMs: 0 }) : false;
+  let exited = isValidPid(pid)
+    ? await waitForProcessExit(pid, { ...livenessOptions, timeoutMs: 0 })
+    : false;
 
   let processOwnershipProven = false;
   if (!shutdownAck && isValidPid(pid) && !exited) {
     const ownsPersistedProcess = ownsBrokerProcess(session, pid, legacySession, options);
     if (!ownsPersistedProcess) {
-      if (isProcessTreeRunning(pid, options)) {
+      if (isProcessTreeRunning(pid, livenessOptions)) {
         throw new Error("Codex app-server broker ownership could not be verified; persisted state was preserved.");
       }
       exited = true;
@@ -439,7 +455,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   }
 
   if (!exited && isValidPid(verifiedPid)) {
-    exited = await waitForProcessExit(verifiedPid, options);
+    exited = await waitForProcessExit(verifiedPid, livenessOptions);
   }
 
   let forced = false;
@@ -451,7 +467,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
     processOwnershipProven = true;
     options.killProcess(verifiedPid);
     forced = true;
-    exited = await waitForProcessExit(verifiedPid, options);
+    exited = await waitForProcessExit(verifiedPid, livenessOptions);
   }
 
   if (!exited) {
@@ -467,7 +483,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   const endpointProven = ownershipVerified || processOwnershipProven;
   let reclaimedStaleEndpoint = false;
   if (!endpointProven && endpointArtifactExists(session.endpoint)) {
-    reclaimedStaleEndpoint = await canReclaimStaleEndpoint(session, pid, options);
+    reclaimedStaleEndpoint = await canReclaimStaleEndpoint(session, pid, livenessOptions);
     if (!reclaimedStaleEndpoint) {
       throw new Error("Codex app-server broker endpoint ownership could not be verified; persisted state was preserved.");
     }
@@ -550,18 +566,48 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
     logFile,
     sessionDir,
     pid: child.pid ?? null,
+    // Cheap on Linux (one /proc read); a one-time ps/PowerShell call
+    // elsewhere. A null fallback degrades gracefully to today's behavior
+    // (no identity check) rather than failing session creation over it.
+    processIdentity: getProcessIdentity(child.pid) ?? null,
     instanceToken
   };
   try {
     saveBrokerSession(cwd, session);
   } catch (error) {
     // The spawn already succeeded, so a failed persist would otherwise leave
-    // an untracked broker running with no state pointing at it.
-    try {
-      shutdownOptions.killProcess(child.pid);
-    } catch {
-      // Teardown must still run and the original persist error must still
-      // surface; a failure to kill the child is secondary to both.
+    // an untracked broker running with no state pointing at it. Killing and
+    // confirming exit before discarding artifacts avoids trading that leak
+    // for a worse one: deleting the socket/session dir out from under a
+    // child that is actually still alive because the kill was denied or slow.
+    //
+    // Build explicit options here instead of reusing shutdownOptions as-is:
+    // a caller-supplied identity must never leak into this check (we only
+    // ever want to compare against the identity we just recorded for this
+    // child), and shutdownOptions carries whatever the caller passed in.
+    const unwindOptions = { ...shutdownOptions, identity: session.processIdentity ?? undefined };
+    // Only signal a pid that is provably still our child, mirroring the same
+    // ownership-before-kill invariant the forced-shutdown path already uses
+    // (see stillOwnsProcess above): the launch token in its argv is proof of
+    // possession, since an unrelated process that merely reused the pid
+    // cannot carry it. If the probe can't read the process at all (already
+    // gone, or unreadable), the gate simply skips the kill and the
+    // wait/preserve branch below handles it loudly either way.
+    if (processMatchesInstanceToken(child.pid, instanceToken, options)) {
+      try {
+        shutdownOptions.killProcess(child.pid);
+      } catch {
+        // A failure to signal the child is secondary to the persist error;
+        // waitForProcessExit below still tells us whether it actually died.
+      }
+    }
+    const childExited = await waitForProcessExit(child.pid, unwindOptions);
+    if (!childExited) {
+      throw new Error(
+        `Codex app-server broker session could not be persisted (${
+          error?.message ?? "unknown error"
+        }), and the spawned process ${child.pid} did not exit; session artifacts were preserved.`
+      );
     }
     teardownBrokerSession({
       endpoint,

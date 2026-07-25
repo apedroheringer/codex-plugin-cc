@@ -336,6 +336,14 @@ function processMatchesInstanceToken(pid, instanceToken, options) {
     : processHasLaunchToken(pid, instanceToken, { ...options, marker: "--instance-token" });
 }
 
+// Legacy sessions have no instance token, so their processes are re-verified
+// by launch artifacts; tokened sessions are re-verified by the token.
+function ownsBrokerProcess(session, pid, legacySession, options) {
+  return legacySession
+    ? processMatchesLegacyBroker(session, pid, options)
+    : processMatchesInstanceToken(pid, session.instanceToken, options);
+}
+
 export async function shutdownBrokerSession(cwd, options = {}) {
   return withBrokerLock(cwd, options, () => shutdownBrokerSessionLocked(cwd, options));
 }
@@ -399,7 +407,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   let exited = isValidPid(pid) ? await waitForProcessExit(pid, { ...options, timeoutMs: 0 }) : false;
 
   if (!shutdownAck && isValidPid(pid) && !exited) {
-    const ownsPersistedProcess = processMatchesInstanceToken(pid, session.instanceToken, options);
+    const ownsPersistedProcess = ownsBrokerProcess(session, pid, legacySession, options);
     if (!ownsPersistedProcess) {
       if (isProcessTreeRunning(pid, options)) {
         throw new Error("Codex app-server broker ownership could not be verified; persisted state was preserved.");
@@ -420,11 +428,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
 
   let forced = false;
   if (!exited && isValidPid(verifiedPid) && options.killProcess) {
-    const stillOwnsProcess = processMatchesInstanceToken(
-      verifiedPid,
-      session.instanceToken,
-      options
-    );
+    const stillOwnsProcess = ownsBrokerProcess(session, verifiedPid, legacySession, options);
     if (!stillOwnsProcess) {
       throw new Error("Codex app-server broker process ownership changed before forced shutdown.");
     }

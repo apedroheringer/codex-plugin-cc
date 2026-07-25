@@ -253,7 +253,7 @@ test("shutdown never follows a private-session symlink", { skip: process.platfor
   assert.equal(loadBrokerSession(workspace), null);
 });
 
-async function spawnLegacyBroker(t, { socketPath, pidFile, endpoint, cwdArg }) {
+async function spawnLegacyBroker(t, { socketPath, pidFile, endpoint, cwdArg, ackShutdown = true }) {
   const child = spawn(
     process.execPath,
     [
@@ -262,6 +262,7 @@ async function spawnLegacyBroker(t, { socketPath, pidFile, endpoint, cwdArg }) {
        const net = require("node:net");
        const socketPath = ${JSON.stringify(socketPath)};
        const pidFile = ${JSON.stringify(pidFile)};
+       const ackShutdown = ${JSON.stringify(ackShutdown)};
        fs.writeFileSync(pidFile, String(process.pid));
        const server = net.createServer((socket) => {
          socket.setEncoding("utf8");
@@ -270,7 +271,7 @@ async function spawnLegacyBroker(t, { socketPath, pidFile, endpoint, cwdArg }) {
            buffer += chunk;
            if (!buffer.includes("\\n")) return;
            const request = JSON.parse(buffer.slice(0, buffer.indexOf("\\n")));
-           if (request.method !== "broker/shutdown") return;
+           if (request.method !== "broker/shutdown" || !ackShutdown) return;
            socket.end(JSON.stringify({ id: request.id, result: {} }) + "\\n", () => {
              server.close(() => process.exit(0));
            });
@@ -361,6 +362,40 @@ test("shutdown retires a legacy broker launched from a different workspace path"
   });
 
   assert.equal(outcome.exited, true);
+  assert.equal(loadBrokerSession(workspace), null);
+  assert.equal(fs.existsSync(socketPath), false);
+});
+
+test("shutdown force-kills a verified legacy broker that ignores shutdown requests", { skip: process.platform === "win32" }, async (t) => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-legacy-");
+  const socketPath = path.join(sessionDir, "broker.sock");
+  const pidFile = path.join(sessionDir, "broker.pid");
+  const endpoint = `unix:${socketPath}`;
+  const child = await spawnLegacyBroker(t, {
+    socketPath,
+    pidFile,
+    endpoint,
+    cwdArg: workspace,
+    ackShutdown: false
+  });
+
+  saveBrokerSession(workspace, {
+    endpoint,
+    pid: child.pid,
+    pidFile,
+    logFile: null,
+    sessionDir
+  });
+
+  const outcome = await shutdownBrokerSession(workspace, {
+    timeoutMs: 500,
+    intervalMs: 10,
+    killProcess: terminateProcessTree
+  });
+
+  assert.equal(outcome.exited, true);
+  assert.equal(outcome.forced, true);
   assert.equal(loadBrokerSession(workspace), null);
   assert.equal(fs.existsSync(socketPath), false);
 });

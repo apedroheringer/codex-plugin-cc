@@ -32,10 +32,6 @@ export function readJsonFile(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
-export function writeJsonFile(filePath, value) {
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-}
-
 export function writePrivateFile(filePath, value) {
   fs.writeFileSync(filePath, value, { encoding: "utf8", mode: PRIVATE_FILE_MODE });
   setMode(filePath, PRIVATE_FILE_MODE);
@@ -61,6 +57,19 @@ export function writeJsonFileAtomic(filePath, value) {
   } catch (error) {
     fs.rmSync(temporaryFile, { force: true });
     throw error;
+  }
+}
+
+export function removeFileIfExists(filePath) {
+  if (!filePath) {
+    return;
+  }
+  try {
+    fs.unlinkSync(filePath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
   }
 }
 

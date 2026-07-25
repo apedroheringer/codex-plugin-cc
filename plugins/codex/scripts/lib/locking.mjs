@@ -111,9 +111,11 @@ function readLockState(lockDir) {
     const owner = JSON.parse(fs.readFileSync(ownerFile, "utf8"));
     const expectedFileName = ownerFileName(owner.token);
     if (
-      !Number.isFinite(owner.pid) ||
+      !Number.isSafeInteger(owner.pid) ||
       owner.pid <= 0 ||
       typeof owner.token !== "string" ||
+      owner.token.length === 0 ||
+      (owner.processIdentity != null && typeof owner.processIdentity !== "string") ||
       fileName !== expectedFileName
     ) {
       return { kind: "corrupt", ageMs };
@@ -185,17 +187,27 @@ function normalizeOptions(options) {
   };
 }
 
+// Returns a handle when the lock was acquired, null when the caller should
+// sleep and retry, and throws once the deadline has passed.
+function tryAcquireOnce(lockDir, normalized, deadline) {
+  const handle = tryAcquire(lockDir);
+  if (handle) {
+    return handle;
+  }
+  reclaimAbandonedLock(lockDir, normalized);
+  if (Date.now() >= deadline) {
+    throw new Error(`Timed out waiting for lock: ${lockDir}`);
+  }
+  return null;
+}
+
 export function acquireLockSync(lockDir, options = {}) {
   const normalized = normalizeOptions(options);
   const deadline = Date.now() + normalized.timeoutMs;
   while (true) {
-    const handle = tryAcquire(lockDir);
+    const handle = tryAcquireOnce(lockDir, normalized, deadline);
     if (handle) {
       return handle;
-    }
-    reclaimAbandonedLock(lockDir, normalized);
-    if (Date.now() >= deadline) {
-      throw new Error(`Timed out waiting for lock: ${lockDir}`);
     }
     sleepSync(normalized.retryDelayMs);
   }
@@ -205,13 +217,9 @@ export async function acquireLock(lockDir, options = {}) {
   const normalized = normalizeOptions(options);
   const deadline = Date.now() + normalized.timeoutMs;
   while (true) {
-    const handle = tryAcquire(lockDir);
+    const handle = tryAcquireOnce(lockDir, normalized, deadline);
     if (handle) {
       return handle;
-    }
-    reclaimAbandonedLock(lockDir, normalized);
-    if (Date.now() >= deadline) {
-      throw new Error(`Timed out waiting for lock: ${lockDir}`);
     }
     await sleep(normalized.retryDelayMs);
   }

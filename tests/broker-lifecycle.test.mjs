@@ -48,7 +48,6 @@ test("concurrent ensureBrokerSession calls share a single authenticated broker",
   assert.equal(persisted.instanceToken, left.instanceToken);
 
   const outcome = await shutdownBrokerSession(workspace, {
-    session: left,
     killProcess: terminateProcessTree
   });
   assert.equal(outcome.exited, true);
@@ -102,7 +101,6 @@ test("broker rejects a shutdown token that does not identify its instance", asyn
   t.after(async () => {
     if (loadBrokerSession(workspace)) {
       await shutdownBrokerSession(workspace, {
-        session,
         killProcess: terminateProcessTree
       });
     }
@@ -118,7 +116,34 @@ test("broker rejects a shutdown token that does not identify its instance", asyn
   assert.ok(loadBrokerSession(workspace));
 });
 
-test("shutdown request stops waiting at its deadline", { skip: process.platform === "win32" }, async (t) => {
+test("shutdown closes idle half-open broker clients", { skip: process.platform === "win32" }, async (t) => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir) });
+  const idleClient = net.createConnection({
+    path: session.endpoint.slice("unix:".length),
+    allowHalfOpen: true
+  });
+  idleClient.on("end", () => {});
+  await new Promise((resolve, reject) => {
+    idleClient.once("connect", resolve);
+    idleClient.once("error", reject);
+  });
+  t.after(() => idleClient.destroy());
+
+  const outcome = await shutdownBrokerSession(workspace, {
+    timeoutMs: 500,
+    intervalMs: 10,
+    killProcess: terminateProcessTree
+  });
+
+  assert.equal(outcome.exited, true);
+  assert.equal(outcome.forced, false);
+  assert.equal(loadBrokerSession(workspace), null);
+});
+
+test("shutdown request always uses a finite deadline", { skip: process.platform === "win32" }, async (t) => {
   const sessionDir = makeTempDir("cxc-unresponsive-");
   const socketPath = path.join(sessionDir, "broker.sock");
   const sockets = new Set();
@@ -137,14 +162,15 @@ test("shutdown request stops waiting at its deadline", { skip: process.platform 
     await new Promise((resolve) => server.close(resolve));
   });
 
-  const startedAt = Date.now();
-  const response = await sendBrokerShutdown(`unix:${socketPath}`, {
-    instanceToken: "instance-token-1234567890",
-    timeoutMs: 40
-  });
-
-  assert.equal(response, null);
-  assert.ok(Date.now() - startedAt < 500, "shutdown request exceeded its deadline");
+  for (const timeoutMs of [0, 40]) {
+    const startedAt = Date.now();
+    const response = await sendBrokerShutdown(`unix:${socketPath}`, {
+      instanceToken: "instance-token-1234567890",
+      timeoutMs
+    });
+    assert.equal(response, null);
+    assert.ok(Date.now() - startedAt < 500, "shutdown request exceeded its deadline");
+  }
   assert.equal(fs.existsSync(socketPath), true);
 });
 
@@ -172,7 +198,6 @@ test("shutdown preserves an unowned endpoint and its persisted state", { skip: p
 
   await assert.rejects(
     shutdownBrokerSession(workspace, {
-      session,
       timeoutMs: 40,
       killProcess: terminateProcessTree
     }),
@@ -181,6 +206,51 @@ test("shutdown preserves an unowned endpoint and its persisted state", { skip: p
 
   assert.equal(fs.existsSync(socketPath), true);
   assert.deepEqual(loadBrokerSession(workspace), session);
+});
+
+test("shutdown never removes artifacts outside a private broker session", async () => {
+  const workspace = makeTempDir();
+  const externalDir = makeTempDir("not-a-broker-session-");
+  const externalFile = path.join(externalDir, "preserve.txt");
+  fs.writeFileSync(externalFile, "preserve me\n");
+  saveBrokerSession(workspace, {
+    endpoint: `unix:${path.join(externalDir, "missing.sock")}`,
+    pid: null,
+    pidFile: externalFile,
+    logFile: null,
+    sessionDir: externalDir
+  });
+
+  const outcome = await shutdownBrokerSession(workspace);
+
+  assert.equal(outcome.exited, true);
+  assert.equal(fs.readFileSync(externalFile, "utf8"), "preserve me\n");
+  assert.equal(loadBrokerSession(workspace), null);
+});
+
+test("shutdown never follows a private-session symlink", { skip: process.platform === "win32" }, async (t) => {
+  const workspace = makeTempDir();
+  const externalDir = makeTempDir("not-a-broker-session-");
+  const externalPidFile = path.join(externalDir, "broker.pid");
+  const sessionLink = makeTempDir("cxc-");
+  fs.writeFileSync(externalPidFile, "preserve me\n");
+  fs.rmdirSync(sessionLink);
+  fs.symlinkSync(externalDir, sessionLink, "dir");
+  t.after(() => fs.unlinkSync(sessionLink));
+
+  saveBrokerSession(workspace, {
+    endpoint: `unix:${path.join(sessionLink, "missing.sock")}`,
+    pid: null,
+    pidFile: path.join(sessionLink, "broker.pid"),
+    logFile: null,
+    sessionDir: sessionLink
+  });
+
+  const outcome = await shutdownBrokerSession(workspace);
+
+  assert.equal(outcome.exited, true);
+  assert.equal(fs.readFileSync(externalPidFile, "utf8"), "preserve me\n");
+  assert.equal(loadBrokerSession(workspace), null);
 });
 
 test("shutdown retires a live tokenless broker left by the previous version", { skip: process.platform === "win32" }, async (t) => {
@@ -247,7 +317,6 @@ test("shutdown retires a live tokenless broker left by the previous version", { 
   saveBrokerSession(workspace, session);
 
   const outcome = await shutdownBrokerSession(workspace, {
-    session,
     timeoutMs: 500,
     intervalMs: 10,
     killProcess: terminateProcessTree
@@ -268,7 +337,6 @@ test("shutdown does not retire an authenticated broker whose persisted token was
   t.after(async () => {
     saveBrokerSession(workspace, authenticatedSession);
     await shutdownBrokerSession(workspace, {
-      session: authenticatedSession,
       killProcess: terminateProcessTree
     });
   });
@@ -278,7 +346,6 @@ test("shutdown does not retire an authenticated broker whose persisted token was
 
   await assert.rejects(
     shutdownBrokerSession(workspace, {
-      session: tokenlessState,
       timeoutMs: 200,
       killProcess: terminateProcessTree
     }),
@@ -304,7 +371,6 @@ test("broker metadata, pid, and log files are private", { skip: process.platform
   assert.equal(fs.statSync(persistedStateFile).mode & 0o777, 0o600);
 
   await shutdownBrokerSession(workspace, {
-    session,
     killProcess: terminateProcessTree
   });
 });
@@ -357,7 +423,6 @@ test("shutdown reclaims the socket of an owned broker that died without acking",
   saveBrokerSession(workspace, session);
 
   const outcome = await shutdownBrokerSession(workspace, {
-    session,
     timeoutMs: 40,
     killProcess: terminateProcessTree
   });
@@ -392,7 +457,7 @@ test("ensureBrokerSession recovers from a stale socket instead of failing", { sk
   const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir) });
   t.after(async () => {
     if (session) {
-      await shutdownBrokerSession(workspace, { session, killProcess: terminateProcessTree });
+      await shutdownBrokerSession(workspace, { killProcess: terminateProcessTree });
     }
   });
 
@@ -445,7 +510,6 @@ test("shutdown still refuses to unlink an endpoint someone is listening on", { s
 
   await assert.rejects(
     shutdownBrokerSession(workspace, {
-      session,
       timeoutMs: 40,
       killProcess: terminateProcessTree
     }),
@@ -483,7 +547,6 @@ test("a refused endpoint alone does not justify reclaiming while the owner lives
 
   await assert.rejects(
     shutdownBrokerSession(workspace, {
-      session,
       timeoutMs: 40,
       killProcess: () => {}
     }),
@@ -520,7 +583,6 @@ test("an endpoint outside the plugin session directory is never reclaimed", { sk
 
   await assert.rejects(
     shutdownBrokerSession(workspace, {
-      session,
       timeoutMs: 40,
       killProcess: terminateProcessTree
     }),

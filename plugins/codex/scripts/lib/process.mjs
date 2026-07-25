@@ -62,7 +62,7 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
-function isValidPid(pid) {
+export function isValidPid(pid) {
   return Number.isSafeInteger(pid) && pid > 0;
 }
 
@@ -85,36 +85,37 @@ function readLinuxProcessStat(pid) {
   }
 }
 
+function queryProcessTable(pid, powershellCommand, psFormat, options) {
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  const spawnOptions = { timeout: options.timeoutMs ?? 2000, killSignal: "SIGTERM" };
+  const result =
+    (options.platform ?? process.platform) === "win32"
+      ? runCommandImpl(
+          "powershell.exe",
+          ["-NoProfile", "-NonInteractive", "-Command", powershellCommand],
+          spawnOptions
+        )
+      : runCommandImpl("ps", ["-ww", "-p", String(pid), "-o", psFormat], spawnOptions);
+  if (result.error || result.signal != null || result.status !== 0) {
+    return null;
+  }
+  return String(result.stdout ?? "");
+}
+
 export function getProcessIdentity(pid, options = {}) {
   if (!isValidPid(pid)) {
     return null;
   }
-  const platform = options.platform ?? process.platform;
-  if (platform === "linux") {
+  if ((options.platform ?? process.platform) === "linux") {
     return readLinuxProcessStat(pid)?.startTime ?? null;
   }
-
-  const runCommandImpl = options.runCommandImpl ?? runCommand;
-  const result =
-    platform === "win32"
-      ? runCommandImpl(
-          "powershell.exe",
-          [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($null -ne $p) { [Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks) }`
-          ],
-          { timeout: options.timeoutMs ?? 2000, killSignal: "SIGTERM" }
-        )
-      : runCommandImpl("ps", ["-ww", "-p", String(pid), "-o", "lstart="], {
-          timeout: options.timeoutMs ?? 2000,
-          killSignal: "SIGTERM"
-        });
-  if (result.error || result.signal != null || result.status !== 0) {
-    return null;
-  }
-  return String(result.stdout ?? "").trim() || null;
+  const output = queryProcessTable(
+    pid,
+    `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($null -ne $p) { [Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks) }`,
+    "lstart=",
+    options
+  );
+  return output?.trim() || null;
 }
 
 export function isProcessRunning(pid, options = {}) {
@@ -228,28 +229,20 @@ export async function waitForProcessExit(pid, options = {}) {
 }
 
 function readProcessCommandLine(pid, options) {
-  const platform = options.platform ?? process.platform;
-  const runCommandImpl = options.runCommandImpl ?? runCommand;
-  const result =
-    platform === "win32"
-      ? runCommandImpl(
-          "powershell.exe",
-          [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($null -ne $p) { [Console]::Out.Write($p.CommandLine) }`
-          ],
-          { timeout: options.timeoutMs ?? 2000, killSignal: "SIGTERM" }
-        )
-      : runCommandImpl("ps", ["-ww", "-p", String(pid), "-o", "command="], {
-          timeout: options.timeoutMs ?? 2000,
-          killSignal: "SIGTERM"
-        });
-  if (result.error || result.signal != null || result.status !== 0) {
+  return queryProcessTable(
+    pid,
+    `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($null -ne $p) { [Console]::Out.Write($p.CommandLine) }`,
+    "command=",
+    options
+  );
+}
+
+function readLinuxCommandLineArgs(pid) {
+  try {
+    return fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+  } catch {
     return null;
   }
-  return String(result.stdout ?? "");
 }
 
 export function processHasLaunchSequence(pid, expectedArgs, options = {}) {
@@ -262,12 +255,9 @@ export function processHasLaunchSequence(pid, expectedArgs, options = {}) {
     return false;
   }
 
-  const platform = options.platform ?? process.platform;
-  if (platform === "linux") {
-    let argv;
-    try {
-      argv = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean);
-    } catch {
+  if ((options.platform ?? process.platform) === "linux") {
+    const argv = readLinuxCommandLineArgs(pid)?.filter(Boolean);
+    if (!argv) {
       return false;
     }
     return argv.some((_, start) =>
@@ -296,14 +286,9 @@ export function processHasLaunchToken(pid, token, options = {}) {
   }
 
   const marker = options.marker ?? "--worker-token";
-  const platform = options.platform ?? process.platform;
-  if (platform === "linux") {
-    try {
-      const argv = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
-      return argv.includes(marker) && argv.includes(token);
-    } catch {
-      return false;
-    }
+  if ((options.platform ?? process.platform) === "linux") {
+    const argv = readLinuxCommandLineArgs(pid);
+    return argv != null && argv.includes(marker) && argv.includes(token);
   }
 
   const commandLine = readProcessCommandLine(pid, options);

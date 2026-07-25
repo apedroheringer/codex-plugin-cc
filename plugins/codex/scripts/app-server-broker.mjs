@@ -106,9 +106,13 @@ async function main() {
     }
   }
 
-  async function shutdown(server) {
+  async function shutdown(server, responseSocket = null) {
     for (const socket of sockets) {
-      socket.end();
+      if (socket === responseSocket) {
+        socket.destroySoon();
+      } else {
+        socket.destroy();
+      }
     }
     await appClient.close().catch(() => {});
     await new Promise((resolve) => server.close(resolve));
@@ -176,7 +180,7 @@ async function main() {
             id: message.id,
             result: { pid: process.pid, instanceToken }
           });
-          await shutdown(server);
+          await shutdown(server, socket);
           process.exit(0);
         }
 

@@ -12,6 +12,7 @@ import {
   ensurePrivateDir,
   PRIVATE_DIR_MODE,
   PRIVATE_FILE_MODE,
+  removeFileIfExists,
   setMode,
   writeJsonFileAtomic
 } from "./fs.mjs";
@@ -19,6 +20,7 @@ import { withLock } from "./locking.mjs";
 import {
   isProcessRunning,
   isProcessTreeRunning,
+  isValidPid,
   processHasLaunchSequence,
   processHasLaunchToken,
   terminateProcessTree,
@@ -26,11 +28,9 @@ import {
 } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
-export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
-export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
 
-export function createBrokerSessionDir(prefix = "cxc-") {
+function createBrokerSessionDir(prefix = "cxc-") {
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   setMode(sessionDir, PRIVATE_DIR_MODE);
   return sessionDir;
@@ -41,34 +41,57 @@ function connectToEndpoint(endpoint) {
   return net.createConnection({ path: target.path });
 }
 
-export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
+/**
+ * One-shot connection probe. Resolves "connect" when something accepted the
+ * connection, "timeout" when nothing settled within timeoutMs, "invalid" when
+ * the endpoint cannot even be parsed, and the error code otherwise.
+ */
+function probeEndpoint(endpoint, timeoutMs) {
+  return new Promise((resolve) => {
+    let socket;
+    try {
+      socket = connectToEndpoint(endpoint);
+    } catch {
+      resolve("invalid");
+      return;
+    }
+    let settled = false;
+    const finish = (value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(value);
+    };
+    // socket.setTimeout(0) disables the timer outright, which would leave this
+    // promise pending forever on a connection that never settles.
+    socket.setTimeout(Math.max(1, timeoutMs), () => finish("timeout"));
+    socket.on("connect", () => finish("connect"));
+    socket.on("error", (error) => finish(error?.code ?? "error"));
+  });
+}
+
+async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const ready = await new Promise((resolve) => {
-      const socket = connectToEndpoint(endpoint);
-      let settled = false;
-      const finish = (value) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        socket.destroy();
-        resolve(value);
-      };
-      socket.setTimeout(Math.max(1, Math.min(150, deadline - Date.now())), () => finish(false));
-      socket.on("connect", () => finish(true));
-      socket.on("error", () => finish(false));
-    });
-    if (ready) {
+    const probe = await probeEndpoint(endpoint, Math.min(150, deadline - Date.now()));
+    if (probe === "connect") {
       return true;
+    }
+    if (probe === "invalid") {
+      return false;
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return false;
 }
 
-export async function sendBrokerShutdown(endpoint, options = {}) {
-  return await new Promise((resolve) => {
+export function sendBrokerShutdown(endpoint, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs)
+    ? Math.max(1, options.timeoutMs)
+    : 2000;
+  return new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
     let settled = false;
     let buffer = "";
@@ -81,7 +104,7 @@ export async function sendBrokerShutdown(endpoint, options = {}) {
       resolve(result);
     };
     socket.setEncoding("utf8");
-    socket.setTimeout(options.timeoutMs ?? 2000, () => finish(null));
+    socket.setTimeout(timeoutMs, () => finish(null));
     socket.on("connect", () => {
       socket.write(
         `${JSON.stringify({
@@ -109,11 +132,7 @@ export async function sendBrokerShutdown(endpoint, options = {}) {
   });
 }
 
-function isValidPid(pid) {
-  return Number.isSafeInteger(pid) && pid > 0;
-}
-
-export function spawnBrokerProcess({
+function spawnBrokerProcess({
   scriptPath,
   cwd,
   endpoint,
@@ -176,15 +195,8 @@ export function saveBrokerSession(cwd, session) {
   writeJsonFileAtomic(resolveBrokerStateFile(cwd), session);
 }
 
-export function clearBrokerSession(cwd) {
-  const stateFile = resolveBrokerStateFile(cwd);
-  try {
-    fs.unlinkSync(stateFile);
-  } catch (error) {
-    if (error?.code !== "ENOENT") {
-      throw error;
-    }
-  }
+function clearBrokerSession(cwd) {
+  removeFileIfExists(resolveBrokerStateFile(cwd));
 }
 
 function resolveBrokerPid(session) {
@@ -229,55 +241,36 @@ function canDiscardUnownedSession(session, pid) {
  * timeout, which is what a live-but-hung broker produces — resolves true so that
  * callers stay conservative and never unlink a socket that someone else owns.
  */
-function endpointAcceptsConnection(endpoint, timeoutMs) {
-  // socket.setTimeout(0) disables the timer outright, which would leave this
-  // promise pending forever on a connection that never settles.
+async function endpointAcceptsConnection(endpoint, timeoutMs) {
   const deadlineMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 250;
-  return new Promise((resolve) => {
-    let socket;
-    try {
-      socket = connectToEndpoint(endpoint);
-    } catch {
-      resolve(true);
-      return;
-    }
-    let settled = false;
-    const finish = (value) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      socket.destroy();
-      resolve(value);
-    };
-    socket.setTimeout(deadlineMs, () => finish(true));
-    socket.on("connect", () => finish(true));
-    socket.on("error", (error) => {
-      const code = error?.code;
-      finish(!(code === "ECONNREFUSED" || code === "ENOENT"));
-    });
-  });
+  const probe = await probeEndpoint(endpoint, deadlineMs);
+  return probe !== "ECONNREFUSED" && probe !== "ENOENT";
 }
 
-/**
- * True when the endpoint path lives inside the session directory this plugin
- * created. Those directories come from mkdtemp with mode 0700, so a path under
- * one is ours by construction — an unrelated process cannot have placed its
- * socket there. Reclaiming is confined to that subtree so a persisted endpoint
- * pointing anywhere else is never unlinked.
- */
-function endpointIsInsideSessionDir(session) {
-  if (!session.sessionDir || !session.endpoint) {
+function resolveOwnedSessionDir(sessionDir) {
+  if (typeof sessionDir !== "string") {
+    return null;
+  }
+  const resolved = path.resolve(sessionDir);
+  const relative = path.relative(path.resolve(os.tmpdir()), resolved);
+  if (path.dirname(relative) !== "." || !path.basename(relative).startsWith("cxc-")) {
+    return null;
+  }
+  try {
+    const stats = fs.lstatSync(resolved);
+    return stats.isDirectory() && !stats.isSymbolicLink() ? resolved : null;
+  } catch {
+    return null;
+  }
+}
+
+function endpointBelongsToSession(session, platform = process.platform) {
+  const sessionDir = resolveOwnedSessionDir(session.sessionDir);
+  if (!sessionDir || !session.endpoint) {
     return false;
   }
   try {
-    const target = parseBrokerEndpoint(session.endpoint);
-    if (target.kind !== "unix") {
-      return false;
-    }
-    const sessionDir = path.resolve(session.sessionDir);
-    const relative = path.relative(sessionDir, path.resolve(target.path));
-    return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+    return session.endpoint === createBrokerEndpoint(sessionDir, platform);
   } catch {
     return false;
   }
@@ -334,7 +327,7 @@ function processMatchesLegacyBroker(cwd, session, pid, options = {}) {
  * all three keeps the blast radius inside our own temp directory.
  */
 async function canReclaimStaleEndpoint(session, pid, options = {}) {
-  if (!endpointIsInsideSessionDir(session)) {
+  if (!endpointBelongsToSession(session, options.platform)) {
     return false;
   }
   // isProcessTreeRunning() checks the process *group* on Linux, so a reused PID
@@ -344,10 +337,6 @@ async function canReclaimStaleEndpoint(session, pid, options = {}) {
     return false;
   }
   return !(await endpointAcceptsConnection(session.endpoint, options.reclaimProbeTimeoutMs));
-}
-
-function waitForBrokerProcessExit(pid, options, timeoutMs) {
-  return waitForProcessExit(pid, { ...options, timeoutMs });
 }
 
 function processMatchesInstanceToken(pid, instanceToken, options) {
@@ -361,7 +350,7 @@ export async function shutdownBrokerSession(cwd, options = {}) {
 }
 
 async function shutdownBrokerSessionLocked(cwd, options = {}) {
-  const session = loadBrokerSession(cwd) ?? options.session;
+  const session = loadBrokerSession(cwd);
   if (!session) {
     return { found: false, exited: true, forced: false, reclaimedStaleEndpoint: false };
   }
@@ -416,7 +405,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   }
 
   let verifiedPid = ownershipVerified ? acknowledgedPid ?? pid : null;
-  let exited = isValidPid(pid) ? await waitForBrokerProcessExit(pid, options, 0) : false;
+  let exited = isValidPid(pid) ? await waitForProcessExit(pid, { ...options, timeoutMs: 0 }) : false;
 
   if (!shutdownAck && isValidPid(pid) && !exited) {
     const ownsPersistedProcess = processMatchesInstanceToken(pid, session.instanceToken, options);
@@ -435,7 +424,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   }
 
   if (!exited && isValidPid(verifiedPid)) {
-    exited = await waitForBrokerProcessExit(verifiedPid, options, options.timeoutMs);
+    exited = await waitForProcessExit(verifiedPid, options);
   }
 
   let forced = false;
@@ -450,7 +439,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
     }
     options.killProcess(verifiedPid);
     forced = true;
-    exited = await waitForBrokerProcessExit(verifiedPid, options, options.timeoutMs);
+    exited = await waitForProcessExit(verifiedPid, options);
   }
 
   if (!exited) {
@@ -481,17 +470,6 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   return { found: true, exited: true, forced, reclaimedStaleEndpoint };
 }
 
-async function isBrokerEndpointReady(endpoint) {
-  if (!endpoint) {
-    return false;
-  }
-  try {
-    return await waitForBrokerEndpoint(endpoint, 150);
-  } catch {
-    return false;
-  }
-}
-
 export async function ensureBrokerSession(cwd, options = {}) {
   return withBrokerLock(cwd, options, () => ensureBrokerSessionLocked(cwd, options));
 }
@@ -507,22 +485,17 @@ function withBrokerLock(cwd, options, action) {
 }
 
 async function ensureBrokerSessionLocked(cwd, options = {}) {
+  const shutdownOptions = {
+    ...options,
+    killProcess: options.killProcess ?? terminateProcessTree
+  };
   const existing = loadBrokerSession(cwd);
-  if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
+  if (existing?.endpoint && (await waitForBrokerEndpoint(existing.endpoint, 150))) {
     return existing;
   }
 
   if (existing) {
-    await shutdownBrokerSessionLocked(cwd, {
-      session: existing,
-      killProcess: options.killProcess ?? terminateProcessTree,
-      verifyProcess: options.verifyProcess,
-      runCommandImpl: options.runCommandImpl,
-      killImpl: options.killImpl,
-      platform: options.platform,
-      timeoutMs: options.timeoutMs,
-      intervalMs: options.intervalMs
-    });
+    await shutdownBrokerSessionLocked(cwd, shutdownOptions);
   }
 
   const sessionDir = createBrokerSessionDir();
@@ -556,23 +529,14 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
-    await shutdownBrokerSessionLocked(cwd, {
-      session,
-      killProcess: options.killProcess ?? terminateProcessTree,
-      verifyProcess: options.verifyProcess,
-      runCommandImpl: options.runCommandImpl,
-      killImpl: options.killImpl,
-      platform: options.platform,
-      timeoutMs: options.timeoutMs,
-      intervalMs: options.intervalMs
-    });
+    await shutdownBrokerSessionLocked(cwd, shutdownOptions);
     return null;
   }
 
   return session;
 }
 
-export function teardownBrokerSession({
+function teardownBrokerSession({
   endpoint = null,
   pidFile,
   logFile,
@@ -583,37 +547,28 @@ export function teardownBrokerSession({
     throw new Error("Refusing to remove an unverified broker endpoint.");
   }
 
-  for (const filePath of [pidFile, logFile]) {
-    if (!filePath) {
-      continue;
-    }
-    try {
-      fs.unlinkSync(filePath);
-    } catch (error) {
-      if (error?.code !== "ENOENT") {
-        throw error;
-      }
-    }
+  const ownedSessionDir = resolveOwnedSessionDir(sessionDir);
+  const files = [];
+  if (ownedSessionDir && pidFile === path.join(ownedSessionDir, "broker.pid")) {
+    files.push(pidFile);
   }
-
-  if (endpoint) {
+  if (ownedSessionDir && logFile === path.join(ownedSessionDir, "broker.log")) {
+    files.push(logFile);
+  }
+  if (ownedSessionDir && endpoint === createBrokerEndpoint(ownedSessionDir)) {
     const target = parseBrokerEndpoint(endpoint);
     if (target.kind === "unix") {
-      try {
-        fs.unlinkSync(target.path);
-      } catch (error) {
-        if (error?.code !== "ENOENT") {
-          throw error;
-        }
-      }
+      files.push(target.path);
     }
   }
 
-  const resolvedSessionDir =
-    sessionDir ?? (pidFile ? path.dirname(pidFile) : logFile ? path.dirname(logFile) : null);
-  if (resolvedSessionDir) {
+  for (const filePath of files) {
+    removeFileIfExists(filePath);
+  }
+
+  if (ownedSessionDir) {
     try {
-      fs.rmdirSync(resolvedSessionDir);
+      fs.rmdirSync(ownedSessionDir);
     } catch (error) {
       if (error?.code !== "ENOENT" && error?.code !== "ENOTEMPTY") {
         throw error;

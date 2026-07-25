@@ -85,7 +85,7 @@ async function handleSessionEnd(input) {
   }
 
   if (failures.length > 0) {
-    throw new AggregateError(failures, "Codex session cleanup did not finish.");
+    throw new AggregateError(failures, `Codex session cleanup did not finish: ${failures.join("; ")}`);
   }
 }
 

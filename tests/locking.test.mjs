@@ -96,6 +96,26 @@ test("unknown lock contents fail closed", () => {
   assert.equal(fs.readFileSync(path.join(lockDir, "unexpected"), "utf8"), "do not delete\n");
 });
 
+test("malformed lock owners fail closed", () => {
+  const owners = [
+    { pid: 1.5, token: "fractional-pid", processIdentity: null },
+    { pid: process.pid, token: "object-identity", processIdentity: {} }
+  ];
+
+  for (const owner of owners) {
+    const lockDir = path.join(makeTempDir(), "state.lock");
+    const ownerFile = path.join(lockDir, `owner-${owner.token}.json`);
+    fs.mkdirSync(lockDir);
+    fs.writeFileSync(ownerFile, `${JSON.stringify(owner)}\n`);
+
+    assert.throws(
+      () => acquireLockSync(lockDir, { timeoutMs: 30, staleMs: 0, retryDelayMs: 5 }),
+      /Timed out waiting for lock/
+    );
+    assert.equal(fs.existsSync(ownerFile), true);
+  }
+});
+
 test("stale legacy lock without process identity does not follow a reused PID forever", () => {
   const lockDir = path.join(makeTempDir(), "state.lock");
   const token = "legacy-owner";

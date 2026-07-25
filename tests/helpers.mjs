@@ -33,7 +33,6 @@ after(async () => {
     }
     try {
       await shutdownBrokerSession(dir, {
-        session,
         killProcess: terminateProcessTree,
         timeoutMs: 1000,
         intervalMs: 25

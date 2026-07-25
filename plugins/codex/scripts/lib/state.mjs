@@ -5,6 +5,7 @@ import path from "node:path";
 
 import {
   ensurePrivateDir,
+  removeFileIfExists,
   writeJsonFileAtomic,
   writePrivateFile
 } from "./fs.mjs";
@@ -93,12 +94,6 @@ function pruneJobs(jobs) {
     .slice(0, MAX_JOBS);
 }
 
-function removeFileIfExists(filePath) {
-  if (filePath && fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-  }
-}
-
 function resolveStateLockDir(cwd) {
   return path.join(resolveStateDir(cwd), ".state.lock");
 }
@@ -120,7 +115,7 @@ function saveStateLocked(cwd, state) {
     if (retainedIds.has(job.id)) {
       continue;
     }
-    removeJobFile(resolveJobFile(cwd, job.id));
+    removeFileIfExists(resolveJobFile(cwd, job.id));
     removeFileIfExists(job.logFile);
   }
 
@@ -193,12 +188,6 @@ export function writeJobFile(cwd, jobId, payload) {
 
 export function readJobFile(jobFile) {
   return JSON.parse(fs.readFileSync(jobFile, "utf8"));
-}
-
-function removeJobFile(jobFile) {
-  if (fs.existsSync(jobFile)) {
-    fs.unlinkSync(jobFile);
-  }
 }
 
 export function resolveJobLogFile(cwd, jobId) {

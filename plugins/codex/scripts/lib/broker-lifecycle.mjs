@@ -406,6 +406,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   let verifiedPid = ownershipVerified ? acknowledgedPid ?? pid : null;
   let exited = isValidPid(pid) ? await waitForProcessExit(pid, { ...options, timeoutMs: 0 }) : false;
 
+  let processOwnershipProven = false;
   if (!shutdownAck && isValidPid(pid) && !exited) {
     const ownsPersistedProcess = ownsBrokerProcess(session, pid, legacySession, options);
     if (!ownsPersistedProcess) {
@@ -415,6 +416,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
       exited = true;
     } else {
       verifiedPid = pid;
+      processOwnershipProven = true;
     }
   }
 
@@ -432,6 +434,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
     if (!stillOwnsProcess) {
       throw new Error("Codex app-server broker process ownership changed before forced shutdown.");
     }
+    processOwnershipProven = true;
     options.killProcess(verifiedPid);
     forced = true;
     exited = await waitForProcessExit(verifiedPid, options);
@@ -444,16 +447,19 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   // ack, so ownershipVerified stays false while the socket file survives. Left
   // fatal, that single stale socket wedges every later command in the workspace,
   // because ensureBrokerSession() shuts the old session down before starting a
-  // replacement. Reclaim it when it is provably dead instead of throwing.
+  // replacement. Ownership proven against the live process (token or launch
+  // artifacts) already covers the endpoint; only an unproven leftover needs the
+  // connection probe, which can race the kernel right after a forced kill.
+  const endpointProven = ownershipVerified || processOwnershipProven;
   let reclaimedStaleEndpoint = false;
-  if (!ownershipVerified && endpointArtifactExists(session.endpoint)) {
+  if (!endpointProven && endpointArtifactExists(session.endpoint)) {
     reclaimedStaleEndpoint = await canReclaimStaleEndpoint(session, pid, options);
     if (!reclaimedStaleEndpoint) {
       throw new Error("Codex app-server broker endpoint ownership could not be verified; persisted state was preserved.");
     }
   }
 
-  const endpointIsOurs = ownershipVerified || reclaimedStaleEndpoint;
+  const endpointIsOurs = endpointProven || reclaimedStaleEndpoint;
   teardownBrokerSession({
     endpoint: endpointIsOurs ? session.endpoint ?? null : null,
     pidFile: session.pidFile ?? null,

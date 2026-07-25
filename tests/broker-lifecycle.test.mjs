@@ -19,6 +19,10 @@ import {
   isProcessTreeRunning,
   terminateProcessTree
 } from "../plugins/codex/scripts/lib/process.mjs";
+import {
+  acquireLock,
+  releaseLock
+} from "../plugins/codex/scripts/lib/locking.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 test("concurrent ensureBrokerSession calls share a single authenticated broker", async () => {
@@ -49,6 +53,43 @@ test("concurrent ensureBrokerSession calls share a single authenticated broker",
   });
   assert.equal(outcome.exited, true);
   assert.equal(loadBrokerSession(workspace), null);
+});
+
+test("shutdown waits for the broker lock and reloads persisted state", async () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const lock = await acquireLock(path.join(stateDir, ".broker.lock"));
+  let settled = false;
+
+  try {
+    const shutdown = shutdownBrokerSession(workspace);
+    shutdown.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      }
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(settled, false, "shutdown bypassed the broker lifecycle lock");
+
+    saveBrokerSession(workspace, {
+      endpoint: `unix:${path.join(workspace, "missing.sock")}`,
+      pid: null,
+      pidFile: null,
+      logFile: null,
+      sessionDir: null
+    });
+    releaseLock(lock);
+
+    const outcome = await shutdown;
+    assert.equal(outcome.found, true);
+    assert.equal(loadBrokerSession(workspace), null);
+  } finally {
+    releaseLock(lock);
+  }
 });
 
 test("broker rejects a shutdown token that does not identify its instance", async (t) => {

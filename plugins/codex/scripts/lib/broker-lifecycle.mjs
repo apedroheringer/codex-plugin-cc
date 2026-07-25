@@ -357,7 +357,11 @@ function processMatchesInstanceToken(pid, instanceToken, options) {
 }
 
 export async function shutdownBrokerSession(cwd, options = {}) {
-  const session = options.session ?? loadBrokerSession(cwd);
+  return withBrokerLock(cwd, options, () => shutdownBrokerSessionLocked(cwd, options));
+}
+
+async function shutdownBrokerSessionLocked(cwd, options = {}) {
+  const session = loadBrokerSession(cwd) ?? options.session;
   if (!session) {
     return { found: false, exited: true, forced: false, reclaimedStaleEndpoint: false };
   }
@@ -489,11 +493,15 @@ async function isBrokerEndpointReady(endpoint) {
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
+  return withBrokerLock(cwd, options, () => ensureBrokerSessionLocked(cwd, options));
+}
+
+function withBrokerLock(cwd, options, action) {
   const stateDir = resolveStateDir(cwd);
   ensurePrivateDir(stateDir);
   return withLock(
     path.join(stateDir, ".broker.lock"),
-    () => ensureBrokerSessionLocked(cwd, options),
+    action,
     { timeoutMs: options.lockTimeoutMs ?? 10000 }
   );
 }
@@ -505,7 +513,7 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
   }
 
   if (existing) {
-    await shutdownBrokerSession(cwd, {
+    await shutdownBrokerSessionLocked(cwd, {
       session: existing,
       killProcess: options.killProcess ?? terminateProcessTree,
       verifyProcess: options.verifyProcess,
@@ -548,7 +556,7 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
-    await shutdownBrokerSession(cwd, {
+    await shutdownBrokerSessionLocked(cwd, {
       session,
       killProcess: options.killProcess ?? terminateProcessTree,
       verifyProcess: options.verifyProcess,

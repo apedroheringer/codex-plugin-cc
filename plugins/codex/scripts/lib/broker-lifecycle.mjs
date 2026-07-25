@@ -197,12 +197,17 @@ function clearBrokerSession(cwd) {
 function resolveBrokerPid(session) {
   const statePid = isValidPid(session.pid) ? session.pid : null;
   let filePid = null;
-  if (session.pidFile && fs.existsSync(session.pidFile)) {
-    const rawPid = fs.readFileSync(session.pidFile, "utf8").trim();
-    if (/^\d+$/.test(rawPid)) {
-      const parsedPid = Number(rawPid);
-      filePid = isValidPid(parsedPid) ? parsedPid : null;
+  let rawPid = null;
+  if (session.pidFile) {
+    try {
+      rawPid = fs.readFileSync(session.pidFile, "utf8").trim();
+    } catch {
+      // A pid file that vanished or cannot be read is treated as absent.
     }
+  }
+  if (rawPid !== null && /^\d+$/.test(rawPid)) {
+    const parsedPid = Number(rawPid);
+    filePid = isValidPid(parsedPid) ? parsedPid : null;
   }
   if (statePid && filePid && statePid !== filePid) {
     throw new Error(`Codex app-server broker PID mismatch (${statePid} != ${filePid}).`);
@@ -359,13 +364,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   let legacyProcessVerified = false;
   if (legacySession) {
     if (canDiscardUnownedSession(session, pid, options)) {
-      teardownBrokerSession({
-        endpoint: null,
-        pidFile: session.pidFile ?? null,
-        logFile: session.logFile ?? null,
-        sessionDir: session.sessionDir ?? null
-      });
-      clearBrokerSession(cwd);
+      teardownAndClear(cwd, session, false);
       return { found: true, exited: true, forced: false, reclaimedStaleEndpoint: false };
     }
     legacyProcessVerified = processMatchesLegacyBroker(session, pid, options);
@@ -460,14 +459,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   }
 
   const endpointIsOurs = endpointProven || reclaimedStaleEndpoint;
-  teardownBrokerSession({
-    endpoint: endpointIsOurs ? session.endpoint ?? null : null,
-    pidFile: session.pidFile ?? null,
-    logFile: session.logFile ?? null,
-    sessionDir: session.sessionDir ?? null,
-    ownershipVerified: endpointIsOurs
-  });
-  clearBrokerSession(cwd);
+  teardownAndClear(cwd, session, endpointIsOurs);
   return { found: true, exited: true, forced, reclaimedStaleEndpoint };
 }
 
@@ -535,6 +527,17 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
   }
 
   return session;
+}
+
+function teardownAndClear(cwd, session, endpointIsOurs) {
+  teardownBrokerSession({
+    endpoint: endpointIsOurs ? session.endpoint ?? null : null,
+    pidFile: session.pidFile ?? null,
+    logFile: session.logFile ?? null,
+    sessionDir: session.sessionDir ?? null,
+    ownershipVerified: endpointIsOurs
+  });
+  clearBrokerSession(cwd);
 }
 
 function teardownBrokerSession({

@@ -10,9 +10,16 @@ const DEFAULT_STALE_MS = 30000;
 const RETRY_DELAY_MS = 25;
 const OWNER_FILE_PREFIX = "owner-";
 const OWNER_FILE_SUFFIX = ".json";
-// Start-time lookup may spawn `ps` or PowerShell off Linux. Cache it once per
-// process instead of paying that cost for every short state update.
-const PROCESS_IDENTITY = getProcessIdentity(process.pid);
+// Start-time lookup may spawn `ps` or PowerShell off Linux. Compute it lazily,
+// on first lock acquisition, and cache it for the rest of the process instead
+// of paying that cost on import for every short state update.
+let processIdentity;
+function cachedProcessIdentity() {
+  if (processIdentity === undefined) {
+    processIdentity = getProcessIdentity(process.pid);
+  }
+  return processIdentity;
+}
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -67,7 +74,7 @@ function tryAcquire(lockDir) {
       pid: process.pid,
       token,
       createdAt: Date.now(),
-      processIdentity: PROCESS_IDENTITY
+      processIdentity: cachedProcessIdentity()
     });
     fs.renameSync(candidateDir, lockDir);
     return handle;

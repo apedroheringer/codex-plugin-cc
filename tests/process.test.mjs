@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 
 import {
   isProcessRunning,
+  processHasLaunchSequence,
   runCommand,
   runCommandChecked,
   terminateProcessTree
@@ -35,6 +36,34 @@ test("Linux zombie processes are treated as exited even when signal 0 succeeds",
   });
 
   assert.equal(running, false);
+});
+
+test("process launch sequence fallback requires arguments in order", () => {
+  const runCommandImpl = (command, args) => ({
+    command,
+    args,
+    status: 0,
+    signal: null,
+    stdout: "node app-server-broker.mjs serve --endpoint pipe:broker --cwd /workspace --pid-file /tmp/broker.pid",
+    stderr: "",
+    error: null
+  });
+
+  assert.equal(
+    processHasLaunchSequence(
+      1234,
+      ["serve", "--endpoint", "pipe:broker", "--cwd", "/workspace", "--pid-file", "/tmp/broker.pid"],
+      { platform: "darwin", runCommandImpl }
+    ),
+    true
+  );
+  assert.equal(
+    processHasLaunchSequence(1234, ["--cwd", "/workspace", "--endpoint", "pipe:broker"], {
+      platform: "darwin",
+      runCommandImpl
+    }),
+    false
+  );
 });
 
 test("terminateProcessTree uses taskkill on Windows", () => {

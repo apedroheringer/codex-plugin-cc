@@ -142,6 +142,112 @@ test("shutdown preserves an unowned endpoint and its persisted state", { skip: p
   assert.deepEqual(loadBrokerSession(workspace), session);
 });
 
+test("shutdown retires a live tokenless broker left by the previous version", { skip: process.platform === "win32" }, async (t) => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-legacy-");
+  const socketPath = path.join(sessionDir, "broker.sock");
+  const pidFile = path.join(sessionDir, "broker.pid");
+  const endpoint = `unix:${socketPath}`;
+  const child = spawn(
+    process.execPath,
+    [
+      "-e",
+      `const fs = require("node:fs");
+       const net = require("node:net");
+       const socketPath = ${JSON.stringify(socketPath)};
+       const pidFile = ${JSON.stringify(pidFile)};
+       fs.writeFileSync(pidFile, String(process.pid));
+       const server = net.createServer((socket) => {
+         socket.setEncoding("utf8");
+         let buffer = "";
+         socket.on("data", (chunk) => {
+           buffer += chunk;
+           if (!buffer.includes("\\n")) return;
+           const request = JSON.parse(buffer.slice(0, buffer.indexOf("\\n")));
+           if (request.method !== "broker/shutdown") return;
+           socket.end(JSON.stringify({ id: request.id, result: {} }) + "\\n", () => {
+             server.close(() => process.exit(0));
+           });
+         });
+       });
+       server.listen(socketPath, () => process.stdout.write("ready\\n"));`,
+      "serve",
+      "--endpoint",
+      endpoint,
+      "--cwd",
+      workspace,
+      "--pid-file",
+      pidFile
+    ],
+    { detached: true, stdio: ["ignore", "pipe", "ignore"] }
+  );
+  await new Promise((resolve, reject) => {
+    child.stdout.on("data", (chunk) => {
+      if (String(chunk).includes("ready")) {
+        resolve();
+      }
+    });
+    child.once("error", reject);
+    child.once("exit", () => reject(new Error("legacy broker exited before binding")));
+  });
+  t.after(() => {
+    if (isProcessTreeRunning(child.pid)) {
+      terminateProcessTree(child.pid);
+    }
+  });
+
+  const session = {
+    endpoint,
+    pid: child.pid,
+    pidFile,
+    logFile: null,
+    sessionDir
+  };
+  saveBrokerSession(workspace, session);
+
+  const outcome = await shutdownBrokerSession(workspace, {
+    session,
+    timeoutMs: 500,
+    intervalMs: 10,
+    killProcess: terminateProcessTree
+  });
+
+  assert.equal(outcome.exited, true);
+  assert.equal(outcome.forced, false);
+  assert.equal(loadBrokerSession(workspace), null);
+  assert.equal(fs.existsSync(socketPath), false);
+});
+
+test("shutdown does not retire an authenticated broker whose persisted token was lost", { skip: process.platform === "win32" }, async (t) => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const authenticatedSession = await ensureBrokerSession(workspace, { env: buildEnv(binDir) });
+  assert.ok(authenticatedSession?.instanceToken);
+  t.after(async () => {
+    saveBrokerSession(workspace, authenticatedSession);
+    await shutdownBrokerSession(workspace, {
+      session: authenticatedSession,
+      killProcess: terminateProcessTree
+    });
+  });
+
+  const { instanceToken: _lostToken, ...tokenlessState } = authenticatedSession;
+  saveBrokerSession(workspace, tokenlessState);
+
+  await assert.rejects(
+    shutdownBrokerSession(workspace, {
+      session: tokenlessState,
+      timeoutMs: 200,
+      killProcess: terminateProcessTree
+    }),
+    /rejected shutdown identity/i
+  );
+
+  assert.equal(isProcessTreeRunning(authenticatedSession.pid), true);
+  assert.deepEqual(loadBrokerSession(workspace), tokenlessState);
+});
+
 test("broker metadata, pid, and log files are private", { skip: process.platform === "win32" }, async () => {
   const workspace = makeTempDir();
   const binDir = makeTempDir();

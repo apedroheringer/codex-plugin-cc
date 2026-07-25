@@ -12,6 +12,7 @@ import { withLock } from "./locking.mjs";
 import {
   isProcessRunning,
   isProcessTreeRunning,
+  processHasLaunchSequence,
   processHasLaunchToken,
   terminateProcessTree,
   waitForProcessExit
@@ -310,6 +311,41 @@ function endpointIsInsideSessionDir(session) {
   }
 }
 
+function processMatchesLegacyBroker(cwd, session, pid, options = {}) {
+  const platform = options.platform ?? process.platform;
+  let expectedEndpoint;
+  try {
+    expectedEndpoint = createBrokerEndpoint(session.sessionDir, platform);
+  } catch {
+    return false;
+  }
+  if (
+    !isValidPid(pid) ||
+    session.endpoint !== expectedEndpoint ||
+    typeof session.pidFile !== "string" ||
+    session.pidFile !== path.join(session.sessionDir, "broker.pid")
+  ) {
+    return false;
+  }
+  return processHasLaunchSequence(
+    pid,
+    [
+      "serve",
+      "--endpoint",
+      session.endpoint,
+      "--cwd",
+      cwd,
+      "--pid-file",
+      session.pidFile
+    ],
+    {
+      platform,
+      timeoutMs: options.timeoutMs,
+      runCommandImpl: options.runCommandImpl
+    }
+  );
+}
+
 /**
  * A stale socket left behind by an owned broker that died before acknowledging
  * shutdown. Ownership cannot be proven by RPC in that case — the process that
@@ -345,7 +381,9 @@ export async function shutdownBrokerSession(cwd, options = {}) {
   }
 
   const pid = resolveBrokerPid(session);
-  if (session.endpoint && !session.instanceToken) {
+  const legacySession = Boolean(session.endpoint && !session.instanceToken);
+  let legacyProcessVerified = false;
+  if (legacySession) {
     if (canDiscardUnownedSession(session, pid)) {
       teardownBrokerSession({
         endpoint: null,
@@ -356,7 +394,12 @@ export async function shutdownBrokerSession(cwd, options = {}) {
       clearBrokerSession(cwd);
       return { found: true, exited: true, forced: false, reclaimedStaleEndpoint: false };
     }
-    throw new Error("Codex app-server broker ownership could not be verified; persisted state was preserved.");
+    legacyProcessVerified = processMatchesLegacyBroker(cwd, session, pid, options);
+    const legacyEndpointIsSafelyStale =
+      isValidPid(pid) && (await canReclaimStaleEndpoint(session, pid, options));
+    if (!legacyProcessVerified && !legacyEndpointIsSafelyStale) {
+      throw new Error("Codex app-server broker ownership could not be verified; persisted state was preserved.");
+    }
   }
 
   let shutdownResponse = null;
@@ -377,15 +420,16 @@ export async function shutdownBrokerSession(cwd, options = {}) {
   const shutdownAck = shutdownResponse?.result ?? null;
   const acknowledgedPid = isValidPid(shutdownAck?.pid) ? shutdownAck.pid : null;
   const ownershipVerified =
-    Boolean(session.instanceToken) &&
-    shutdownAck?.instanceToken === session.instanceToken &&
-    acknowledgedPid !== null &&
-    (pid === null || pid === acknowledgedPid);
+    (Boolean(session.instanceToken) &&
+      shutdownAck?.instanceToken === session.instanceToken &&
+      acknowledgedPid !== null &&
+      (pid === null || pid === acknowledgedPid)) ||
+    (legacySession && legacyProcessVerified && Boolean(shutdownAck));
   if (shutdownAck && !ownershipVerified) {
     throw new Error("Codex app-server broker shutdown identity did not match persisted state.");
   }
 
-  let verifiedPid = ownershipVerified ? acknowledgedPid : null;
+  let verifiedPid = ownershipVerified ? acknowledgedPid ?? pid : null;
   let exited = isValidPid(pid)
     ? await waitForProcessExit(pid, {
         timeoutMs: 0,

@@ -90,10 +90,31 @@ export function getProcessIdentity(pid, options = {}) {
     return null;
   }
   const platform = options.platform ?? process.platform;
-  if (platform !== "linux") {
+  if (platform === "linux") {
+    return readLinuxProcessStat(pid)?.startTime ?? null;
+  }
+
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  const result =
+    platform === "win32"
+      ? runCommandImpl(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($null -ne $p) { [Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks) }`
+          ],
+          { timeout: options.timeoutMs ?? 2000, killSignal: "SIGTERM" }
+        )
+      : runCommandImpl("ps", ["-ww", "-p", String(pid), "-o", "lstart="], {
+          timeout: options.timeoutMs ?? 2000,
+          killSignal: "SIGTERM"
+        });
+  if (result.error || result.signal != null || result.status !== 0) {
     return null;
   }
-  return readLinuxProcessStat(pid)?.startTime ?? null;
+  return String(result.stdout ?? "").trim() || null;
 }
 
 export function isProcessRunning(pid, options = {}) {
@@ -126,6 +147,12 @@ export function isProcessRunning(pid, options = {}) {
       return false;
     }
     if (options.identity != null && stat.startTime !== String(options.identity)) {
+      return false;
+    }
+  } else if (options.identity != null) {
+    const currentIdentity = getProcessIdentity(pid, options);
+    // Failure to inspect a live process is not proof that it was replaced.
+    if (currentIdentity != null && currentIdentity !== String(options.identity)) {
       return false;
     }
   }

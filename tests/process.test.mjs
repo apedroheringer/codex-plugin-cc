@@ -3,6 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  getProcessIdentity,
   isProcessRunning,
   processHasLaunchSequence,
   runCommand,
@@ -32,6 +33,75 @@ test("Linux zombie processes are treated as exited even when signal 0 succeeds",
     killImpl() {},
     readProcessStat() {
       return { state: "Z", startTime: "42" };
+    }
+  });
+
+  assert.equal(running, false);
+});
+
+test("macOS process identity uses the process start time", () => {
+  let captured = null;
+  const identity = getProcessIdentity(1234, {
+    platform: "darwin",
+    runCommandImpl(command, args) {
+      captured = { command, args };
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "Fri Jul 25 01:02:03 2026\n",
+        stderr: "",
+        error: null
+      };
+    }
+  });
+
+  assert.deepEqual(captured, {
+    command: "ps",
+    args: ["-ww", "-p", "1234", "-o", "lstart="]
+  });
+  assert.equal(identity, "Fri Jul 25 01:02:03 2026");
+});
+
+test("Windows process identity uses PowerShell start-time ticks", () => {
+  let capturedCommand = null;
+  const identity = getProcessIdentity(1234, {
+    platform: "win32",
+    runCommandImpl(command, args) {
+      capturedCommand = { command, args };
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "638890021230000000",
+        stderr: "",
+        error: null
+      };
+    }
+  });
+
+  assert.equal(capturedCommand.command, "powershell.exe");
+  assert.match(capturedCommand.args.at(-1), /Get-Process -Id 1234/);
+  assert.equal(identity, "638890021230000000");
+});
+
+test("non-Linux process identity distinguishes a reused PID", () => {
+  const running = isProcessRunning(1234, {
+    platform: "darwin",
+    identity: "original-start",
+    killImpl() {},
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "replacement-start\n",
+        stderr: "",
+        error: null
+      };
     }
   });
 

@@ -103,3 +103,31 @@ test("unknown lock contents fail closed", () => {
   );
   assert.equal(fs.readFileSync(path.join(lockDir, "unexpected"), "utf8"), "do not delete\n");
 });
+
+test("stale legacy lock without process identity does not follow a reused PID forever", () => {
+  const lockDir = path.join(makeTempDir(), "state.lock");
+  const token = "legacy-owner";
+  fs.mkdirSync(lockDir, { mode: 0o700 });
+  fs.writeFileSync(
+    path.join(lockDir, `owner-${token}.json`),
+    `${JSON.stringify({
+      pid: process.pid,
+      token,
+      createdAt: Date.now() - 60000,
+      processIdentity: null
+    })}\n`,
+    { mode: 0o600 }
+  );
+  const oldTime = new Date(Date.now() - 60000);
+  fs.utimesSync(lockDir, oldTime, oldTime);
+
+  const successor = acquireLockSync(lockDir, {
+    timeoutMs: 200,
+    staleMs: 30000,
+    retryDelayMs: 5,
+    isProcessRunning: () => true
+  });
+
+  assert.notEqual(successor.token, token);
+  assert.equal(releaseLock(successor), true);
+});

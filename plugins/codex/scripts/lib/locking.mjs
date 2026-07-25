@@ -10,6 +10,9 @@ const DEFAULT_STALE_MS = 30000;
 const RETRY_DELAY_MS = 25;
 const OWNER_FILE_PREFIX = "owner-";
 const OWNER_FILE_SUFFIX = ".json";
+// Start-time lookup may spawn `ps` or PowerShell off Linux. Cache it once per
+// process instead of paying that cost for every short state update.
+const PROCESS_IDENTITY = getProcessIdentity(process.pid);
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -64,7 +67,7 @@ function tryAcquire(lockDir) {
       pid: process.pid,
       token,
       createdAt: Date.now(),
-      processIdentity: getProcessIdentity(process.pid)
+      processIdentity: PROCESS_IDENTITY
     });
     fs.renameSync(candidateDir, lockDir);
     return handle;
@@ -144,11 +147,18 @@ function reclaimAbandonedLock(lockDir, options) {
   }
   if (state.kind === "owned") {
     const processRunning = options.isProcessRunning ?? isProcessRunning;
+    const processIdentity = state.owner.processIdentity ?? null;
     if (
       processRunning(state.owner.pid, {
-        identity: state.owner.processIdentity ?? undefined
+        identity: processIdentity ?? undefined
       })
     ) {
+      // Older locks on macOS and Windows did not record a process identity.
+      // Once such a short-lived critical section is stale, a live PID alone
+      // cannot distinguish the original owner from an unrelated reused PID.
+      if (processIdentity == null && state.ageMs > options.staleMs) {
+        return removeOwnedLock(state.ownerFile, lockDir);
+      }
       return false;
     }
     return removeOwnedLock(state.ownerFile, lockDir);

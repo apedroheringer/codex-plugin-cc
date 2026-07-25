@@ -271,7 +271,7 @@ function endpointBelongsToSession(session, platform = process.platform) {
   }
 }
 
-function processMatchesLegacyBroker(cwd, session, pid, options = {}) {
+function processMatchesLegacyBroker(session, pid, options = {}) {
   const platform = options.platform ?? process.platform;
   let expectedEndpoint;
   try {
@@ -287,22 +287,18 @@ function processMatchesLegacyBroker(cwd, session, pid, options = {}) {
   ) {
     return false;
   }
-  return processHasLaunchSequence(
-    pid,
-    [
-      "serve",
-      "--endpoint",
-      session.endpoint,
-      "--cwd",
-      cwd,
-      "--pid-file",
-      session.pidFile
-    ],
-    {
-      platform,
-      timeoutMs: options.timeoutMs,
-      runCommandImpl: options.runCommandImpl
-    }
+  const probeOptions = {
+    platform,
+    timeoutMs: options.timeoutMs,
+    runCommandImpl: options.runCommandImpl
+  };
+  // The broker's original --cwd argument is not persisted, and the current
+  // invocation may address the same workspace through a different path, so
+  // ownership is proven by the launch artifacts unique to this session: its
+  // endpoint and its pid file inside the mkdtemp session directory.
+  return (
+    processHasLaunchSequence(pid, ["serve", "--endpoint", session.endpoint], probeOptions) &&
+    processHasLaunchSequence(pid, ["--pid-file", session.pidFile], probeOptions)
   );
 }
 
@@ -364,7 +360,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
       clearBrokerSession(cwd);
       return { found: true, exited: true, forced: false, reclaimedStaleEndpoint: false };
     }
-    legacyProcessVerified = processMatchesLegacyBroker(cwd, session, pid, options);
+    legacyProcessVerified = processMatchesLegacyBroker(session, pid, options);
     const legacyEndpointIsSafelyStale =
       isValidPid(pid) && (await canReclaimStaleEndpoint(session, pid, options));
     if (!legacyProcessVerified && !legacyEndpointIsSafelyStale) {

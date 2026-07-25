@@ -253,12 +253,7 @@ test("shutdown never follows a private-session symlink", { skip: process.platfor
   assert.equal(loadBrokerSession(workspace), null);
 });
 
-test("shutdown retires a live tokenless broker left by the previous version", { skip: process.platform === "win32" }, async (t) => {
-  const workspace = makeTempDir();
-  const sessionDir = makeTempDir("cxc-legacy-");
-  const socketPath = path.join(sessionDir, "broker.sock");
-  const pidFile = path.join(sessionDir, "broker.pid");
-  const endpoint = `unix:${socketPath}`;
+async function spawnLegacyBroker(t, { socketPath, pidFile, endpoint, cwdArg }) {
   const child = spawn(
     process.execPath,
     [
@@ -286,7 +281,7 @@ test("shutdown retires a live tokenless broker left by the previous version", { 
       "--endpoint",
       endpoint,
       "--cwd",
-      workspace,
+      cwdArg,
       "--pid-file",
       pidFile
     ],
@@ -306,6 +301,16 @@ test("shutdown retires a live tokenless broker left by the previous version", { 
       terminateProcessTree(child.pid);
     }
   });
+  return child;
+}
+
+test("shutdown retires a live tokenless broker left by the previous version", { skip: process.platform === "win32" }, async (t) => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-legacy-");
+  const socketPath = path.join(sessionDir, "broker.sock");
+  const pidFile = path.join(sessionDir, "broker.pid");
+  const endpoint = `unix:${socketPath}`;
+  const child = await spawnLegacyBroker(t, { socketPath, pidFile, endpoint, cwdArg: workspace });
 
   const session = {
     endpoint,
@@ -324,6 +329,38 @@ test("shutdown retires a live tokenless broker left by the previous version", { 
 
   assert.equal(outcome.exited, true);
   assert.equal(outcome.forced, false);
+  assert.equal(loadBrokerSession(workspace), null);
+  assert.equal(fs.existsSync(socketPath), false);
+});
+
+test("shutdown retires a legacy broker launched from a different workspace path", { skip: process.platform === "win32" }, async (t) => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-legacy-");
+  const socketPath = path.join(sessionDir, "broker.sock");
+  const pidFile = path.join(sessionDir, "broker.pid");
+  const endpoint = `unix:${socketPath}`;
+  // The previous plugin version may have launched the broker with a --cwd
+  // that addressed this workspace through another path (subdirectory,
+  // symlink). Ownership must not depend on the current invocation path.
+  const originalCwd = path.join(workspace, "nested", "launch-dir");
+  fs.mkdirSync(originalCwd, { recursive: true });
+  const child = await spawnLegacyBroker(t, { socketPath, pidFile, endpoint, cwdArg: originalCwd });
+
+  saveBrokerSession(workspace, {
+    endpoint,
+    pid: child.pid,
+    pidFile,
+    logFile: null,
+    sessionDir
+  });
+
+  const outcome = await shutdownBrokerSession(workspace, {
+    timeoutMs: 500,
+    intervalMs: 10,
+    killProcess: terminateProcessTree
+  });
+
+  assert.equal(outcome.exited, true);
   assert.equal(loadBrokerSession(workspace), null);
   assert.equal(fs.existsSync(socketPath), false);
 });
